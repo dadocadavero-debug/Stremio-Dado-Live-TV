@@ -278,6 +278,11 @@ function isSelectedFirstTeam(value = "") {
 function wantedEvent(name = "") {
   if (unwanted(name)) return false;
 
+  // League headings are not match events. Do not mistake "Liga Portugal"
+  // for a match involving the Portugal national team.
+  if (/^\s*(?:liga|league|campionato|championship)\s+/i.test(String(name)) &&
+      getMatchSides(name).length === 0) return false;
+
   const sides = getMatchSides(name);
   if (sides.length === 2) {
     return sides.some(isSelectedFirstTeam);
@@ -1384,56 +1389,43 @@ app.get(
 app.get(
   "/debug/filter",
   async (req, res) => {
-
+    // Prevent a browser or intermediary from reusing an older diagnostic.
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate");
     try {
-
-      const all =
-        await getProviderEvents();
-
+      const all = await getProviderEvents();
+      const passed = all.filter(e => wantedEvent(e.name));
+      const excluded = all.filter(e => !wantedEvent(e.name));
 
       res.json({
-
-        totale:
-          all.length,
-
-        passati:
-          all
-            .filter(
-              e => wantedEvent(e.name)
-            )
-            .map(
-              e => e.name
-            ),
-
-        scartati:
-          all
-            .filter(
-              e => !wantedEvent(e.name)
-            )
-            .map(
-              e => e.name
-            ), 
-
-        riconosciutiComeIndesiderati:
-  all
-    .filter(
-      e => unwanted(e.name)
-    )
-    .map(
-      e => e.name
-    )
+        versioneFiltro: "reserve-aware-20261019-v2",
+        generatoAlle: new Date().toISOString(),
+        autoTest: {
+          "Inter vs Ajax II": wantedEvent("Inter vs Ajax II"),
+          "Beitar Jerusalem vs Maccabi Tel Aviv": wantedEvent("Beitar Jerusalem vs Maccabi Tel Aviv"),
+          "Ajax II vs De Graafschap": wantedEvent("Ajax II vs De Graafschap"),
+          "PSV II vs Dordrecht": wantedEvent("PSV II vs Dordrecht"),
+          "Juventus II vs Renate": wantedEvent("Juventus II vs Renate"),
+          "Liga Portugal Betclic": wantedEvent("Liga Portugal Betclic")
+        },
+        totale: all.length,
+        passati: passed.map(e => e.name),
+        scartati: excluded.map(e => e.name),
+        // Include original source and metadata only for the puzzling examples.
+        eventiDaControllare: all
+          .filter(e => /\b(bayern|ajax|psv|juventus|beitar|liga portugal)\b/i.test(e.name))
+          .map(e => ({
+            fonte: e.source,
+            nome: e.name,
+            ammessa: wantedEvent(e.name),
+            descrizione: String(e.description || "").slice(0, 220)
+          })),
+        riconosciutiComeIndesiderati: all
+          .filter(e => unwanted(e.name))
+          .map(e => e.name)
       });
-
-
     } catch (error) {
-
-      res.status(500).json({
-        error:
-          String(error)
-      });
-
+      res.status(500).json({error: String(error)});
     }
-
   }
 );
 
