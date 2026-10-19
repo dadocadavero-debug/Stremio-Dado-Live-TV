@@ -909,7 +909,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.0.2",
+    "3.0.3",
 
   name:
     "Dado Live TV",
@@ -939,7 +939,7 @@ const manifest = {
         "live_football_v5",
 
       name:
-        "🔴 Live Football ⚽"
+        "🔴 LIVE Football ⚽"
     }
   ],
 
