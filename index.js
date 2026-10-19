@@ -371,6 +371,12 @@ async function getProviderEvents() {
     );
 
 
+  // An outage in every provider must not replace an existing catalog with an empty one.
+  if (!results.some(result => result.status === "fulfilled")) {
+    throw new Error("All provider catalogs unavailable");
+  }
+
+
   const events = [];
 
 
@@ -690,41 +696,61 @@ async function getCatalogEvents() {
 
 let catalogCache = {
   expires: 0,
+  staleUntil: 0,
+  initialized: false,
   events: []
 };
 
+let catalogRefreshPromise = null;
 
-const CACHE_MS =
-  5 * 60 * 1000;
-
+// Keep the same five-minute fresh cache as the original addon.
+const CACHE_MS = 5 * 60 * 1000;
+const STALE_MS = 20 * 60 * 1000;
+const RETRY_MS = 30 * 1000;
 
 async function getCachedCatalog() {
+  const now = Date.now();
 
-  if (
-    catalogCache.expires >
-      Date.now() &&
-    catalogCache.events.length
-  ) {
-
+  if (catalogCache.initialized && catalogCache.expires > now) {
     return catalogCache.events;
   }
 
+  // Share provider requests between concurrent Stremio catalog requests.
+  if (!catalogRefreshPromise) {
+    catalogRefreshPromise = getCatalogEvents()
+      .then(events => {
+        const updated = Date.now();
+        catalogCache = {
+          expires: updated + CACHE_MS,
+          staleUntil: updated + STALE_MS,
+          initialized: true,
+          events
+        };
+        return events;
+      })
+      .catch(error => {
+        console.error("Catalog refresh failed:", error);
+        if (catalogCache.initialized) {
+          catalogCache.expires = Math.min(
+            Date.now() + RETRY_MS,
+            catalogCache.staleUntil
+          );
+        }
+        throw error;
+      })
+      .finally(() => {
+        catalogRefreshPromise = null;
+      });
+  }
 
-  const events =
-    await getCatalogEvents();
+  // Show recent cached events immediately while checking fresh provider data.
+  // Never keep older live events past the bounded stale cache interval.
+  if (catalogCache.initialized && catalogCache.staleUntil > now) {
+    catalogRefreshPromise.catch(() => {});
+    return catalogCache.events;
+  }
 
-
-  catalogCache = {
-
-    expires:
-      Date.now() +
-      CACHE_MS,
-
-    events
-  };
-
-
-  return events;
+  return catalogRefreshPromise;
 }
 
 
