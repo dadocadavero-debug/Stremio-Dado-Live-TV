@@ -909,7 +909,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.0.1",
+    "3.0.2",
 
   name:
     "Dado Live TV",
@@ -918,7 +918,7 @@ const manifest = {
     "Top Club Europei & Nazionali",
 
   logo:
-    "https://stremio-live-test-20261019.onrender.com/logo.jpg",
+    "https://stremio-live-test-20261019.onrender.com/logo.png",
 
   resources: [
     "catalog",
@@ -965,9 +965,10 @@ app.get(
 /* =========================================================
    LOGO PERSONALIZZATO DADO LIVE TV
 ========================================================= */
-app.get("/logo.jpg", (req, res) => {
-  res.type("jpeg");
-  res.sendFile(require("path").join(__dirname, "assets", "dado-live-tv.jpg"));
+app.get("/logo.png", (req, res) => {
+  res.set("Cache-Control", "public, max-age=3600");
+  res.type("png");
+  res.sendFile(require("path").join(__dirname, "assets", "dado-live-tv.png"));
 });
 
 /* =========================================================
