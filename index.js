@@ -1296,6 +1296,40 @@ app.get(
 
 
 
+
+/* TZ_CANDIDATE_CHECK: temporary read-only test; remove before finalizing. */
+(async () => {
+  const configs = [
+    ["WAT", "1q1YqqVKyUgp3DFGqBQA"],
+    ["GMT", "1q1YqqVKyUnL3DVGqBQA"],
+    ["UTC+2", "1q1YqqVKyUgoNcdY2UqoFAA"],
+    ["GMT+2", "1q1YqqVKyUnL3DdE2UqoFAA"],
+    ["CEST", "1q1YqqVKyUnJ2DQ5RqgUA"],
+    ["EET", "1q1YqqVKyUnJ1DVGqBQA"],
+    ["CAT", "1q1YqqVKyUnJ2DFGqBQA"],
+    ["WAST", "1q1YqqVKyUgp3DA5RqgUA"]
+  ];
+  for (const [tz, token] of configs) {
+    const url = "https://stremverse1.alwaysdata.net/" + token;
+    try {
+      const [manifest, catalog] = await Promise.all([
+        getJsonRaw(url + "/manifest.json", 9500),
+        getJsonRaw(url + "/catalog/tv/stremverse_live_events/genre=Football.json", 9500)
+      ]);
+      const metas = Array.isArray(catalog.metas) ? catalog.metas : [];
+      const match = metas.find(x => /monza.+cagliari|parma.+torino/i.test(x.name || "")) || metas[0];
+      console.log("TZ_CANDIDATE_CHECK", JSON.stringify({
+        tz,
+        manifest: {id:manifest.id,name:manifest.name,version:manifest.version,description:manifest.description},
+        count: metas.length,
+        event: match && {id:match.id,name:match.name,poster:match.poster}
+      }));
+    } catch (e) {
+      console.log("TZ_CANDIDATE_CHECK_ERROR", tz, String(e));
+    }
+  }
+})();
+
 /* =========================================================
    ROOT
 ========================================================= */
