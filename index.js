@@ -11,6 +11,13 @@ const STREMVERSE =
 const HIGHFLY =
   "https://sports.highfly.to/eyJpbmNsdWRlU3BvcnRzIjpbImZvb3RiYWxsIl19";
 
+const HIGHFLY_BACKUPS = [
+  "https://sportsfree.highfly.to/eyJpbmNsdWRlU3BvcnRzIjpbImZvb3RiYWxsIl19",
+  "https://sportsfree-us2.highfly.to/eyJpbmNsdWRlU3BvcnRzIjpbImZvb3RiYWxsIl19"
+];
+
+let preferredHighflyBase = HIGHFLY;
+
 
 /* =========================================================
    NORMALIZZAZIONE
@@ -276,43 +283,56 @@ function wantedEvent(name = "") {
    FETCH JSON
 ========================================================= */
 
-async function getJson(url) {
-
-  const controller =
-    new AbortController();
-
-  const timer =
-    setTimeout(
-      () => controller.abort(),
-      12000
-    );
+async function getJsonRaw(url, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-
-    const response =
-      await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          "User-Agent":
-            "Stremio-LIVE/3.0"
-        }
-      });
-
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Stremio-LIVE/3.0" }
+    });
 
     if (!response.ok) {
-
-      throw new Error(
-        `${response.status} ${url}`
-      );
+      throw new Error(`${response.status} ${url}`);
     }
 
-
     return await response.json();
-
   } finally {
-
     clearTimeout(timer);
   }
+}
+
+// Prefer the primary Highfly domain; keep the original football configuration.
+async function getJson(url) {
+  if (!url.startsWith(`${HIGHFLY}/`)) {
+    return getJsonRaw(url);
+  }
+
+  const suffix = url.slice(HIGHFLY.length);
+  const bases = [
+    ...new Set([preferredHighflyBase, HIGHFLY, ...HIGHFLY_BACKUPS])
+  ];
+  let lastError;
+
+  for (const base of bases) {
+    try {
+      const json = await getJsonRaw(
+        `${base}${suffix}`,
+        base === HIGHFLY ? 8000 : 5000
+      );
+      if (preferredHighflyBase !== base) {
+        console.log("Highfly source switched to", base.split("/")[2]);
+        preferredHighflyBase = base;
+      }
+      return json;
+    } catch (error) {
+      lastError = error;
+      console.warn("Highfly source unreachable:", base.split("/")[2], String(error));
+    }
+  }
+
+  throw lastError || new Error("All Highfly servers unavailable");
 }
 
 
