@@ -49,18 +49,16 @@ function normalize(str = "") {
 ========================================================= */
 
 function unwanted(name = "") {
-
   const n = normalize(name);
 
+  // Always exclude women's and youth competitions, regardless of provider.
+  // Second teams (II, B, Reserves) are handled per opponent below instead:
+  // Inter vs Ajax II is a legitimate match for the selected first team.
   return (
-    /\b(women|woman|female|femminile|femminili|femenino|feminino|ladies)\b/.test(n) ||
-
-    /\b(u\s?-?\s?(15|16|17|18|19|20|21|22|23)|under\s?(15|16|17|18|19|20|21|22|23))\b/.test(n) ||
-
-    /\b(youth|giovanili|primavera|reserve|reserves|academy)\b/.test(n) ||
-
-    /\b(b team|team b)\b/.test(n)
-);
+    /\b(women|woman|womens|female|femminile|femminili|femenino|feminino|feminine|feminin|frauen|ladies)\b/.test(n) ||
+    /\b(u\s?(15|16|17|18|19|20|21|22|23)|under\s?(15|16|17|18|19|20|21|22|23))\b/.test(n) ||
+    /\b(youth|giovanili|giovanile|primavera|academy)\b/.test(n)
+  );
 }
 
 
@@ -234,53 +232,63 @@ const aliases = {
 
 
 
+// Match whole team names, never incidental substrings (USA in Jerusalem).
+function hasTeamTerm(value = "", term = "") {
+  const haystack = normalize(value);
+  const needle = normalize(term);
+  return Boolean(needle) && (` ${haystack} `).includes(` ${needle} `);
+}
+
+// Prefer actual opponents rather than competition headings.
+// Examples: "Netherlands - Eerste Divisie: Ajax II vs De Graafschap"
+// and "Serie A: Inter vs Ajax II".
+function getMatchSides(name = "") {
+  const raw = String(name).replace(/\s+/g, " ").trim();
+  const versus = /\s+(?:vs?\.?|versus|x)\s+/i.exec(raw);
+  if (versus) {
+    const left = raw.slice(0, versus.index).split(":").pop().trim();
+    const right = raw.slice(versus.index + versus[0].length).split("|")[0].trim();
+    if (left && right) return [left, right];
+  }
+
+  // Some sources use "Team A - Team B" instead of "vs".
+  const suffix = raw.includes(":") ? raw.split(":").pop().trim() : raw;
+  const separated = suffix.split(/\s+[-–—]\s+/).map(s => s.trim()).filter(Boolean);
+  if (separated.length === 2) return separated;
+
+  return [];
+}
+
+// II/B/Reserves are an opponent attribute, not a blanket match exclusion.
+function isReserveTeamSide(value = "") {
+  const n = normalize(value);
+  return /\b(ii|iii|iv|b|reserves?|b team|team b|second team)\b/.test(n);
+}
+
+const selectedTeamNames = [
+  ...wantedTeams,
+  ...Object.values(aliases).flat()
+];
+
+function isSelectedFirstTeam(value = "") {
+  return !isReserveTeamSide(value) &&
+    selectedTeamNames.some(team => hasTeamTerm(value, team));
+}
+
 function wantedEvent(name = "") {
+  if (unwanted(name)) return false;
 
-  if (unwanted(name)) {
-    return false;
+  const sides = getMatchSides(name);
+  if (sides.length === 2) {
+    return sides.some(isSelectedFirstTeam);
   }
 
-
-  const n =
-    normalize(name);
-
-
-  // nome normale
-
-  if (
-    wantedTeams.some(
-      team =>
-        n.includes(
-          normalize(team)
-        )
-    )
-  ) {
-    return true;
-  }
-
-
-  // alias
-
-  for (
-    const key of Object.keys(aliases)
-  ) {
-
-    for (
-      const alias of aliases[key]
-    ) {
-
-      if (
-        n.includes(
-          normalize(alias)
-        )
-      ) {
-        return true;
-      }
-    }
-  }
-
-
-  return false;
+  // Conservative fallback for uncommon provider event titles.
+  // Strip a league prefix when available; still match complete words.
+  const fallback = String(name).includes(":")
+    ? String(name).split(":").pop()
+    : String(name);
+  return isSelectedFirstTeam(fallback);
 }
 
 
@@ -676,18 +684,18 @@ function getInterestingTeams(name = "") {
 
 
 function eventKey(name = "") {
-
   const teams = getInterestingTeams(name);
 
-  if (!teams.length) {
-    return "";
+  if (!teams.length) return "";
+
+  // Keep first-team vs reserve-team fixtures separate from their
+  // first-team equivalents (Inter-Ajax II != Inter-Ajax).
+  const sides = getMatchSides(name);
+  if (sides.length === 2 && sides.some(isReserveTeamSide)) {
+    return "reserve:" + sides.map(normalize).sort().join("|");
   }
 
-  return teams
-    .map(t => normalize(t))
-    .sort()
-    .join("|");
-
+  return teams.map(t => normalize(t)).sort().join("|");
 }
 
 
@@ -718,7 +726,8 @@ async function getCatalogEvents() {
     // Keep original SV/HF events unchanged. Add Flix as a verified
     // extra source only when both opponents match the existing event.
     if (event.source === "flix") {
-      if (isSecondTeamMatch(event.name)) continue;
+      // The shared filter already excludes matches without a selected first team.
+      // Do not discard Inter vs Ajax II merely because Flix is the provider.
       const pair = safeMatchPair(event.name);
       const matched = pair
         ? Array.from(map.values()).find(item => safeMatchPair(item.name) === pair)
