@@ -18,6 +18,11 @@ const HIGHFLY_BACKUPS = [
 
 let preferredHighflyBase = HIGHFLY;
 
+// Shared, non-personal Flix-Streams Free soccer configuration.
+// No user install ID, subscriber access or film catalog is included.
+const FLIX_FREE =
+  "https://free.flixnest.app/eJyNULtuwzAM_BfOERo4RQbv3bsXAaHIdC1UD4OkHKBF_71ynNZJm6GTIN7xjncfgCRCSb0NGPxESFP9CdoQ8gm7IMpko2AiPWV-g1a50AawZyIUN1C00EKzbfbbfdOYZdv0PiixGbPMz7SDDaxSziq9ZvYk0L6scyNjZjXV2Eh2ru5dxOaz4HCjMNiUKOBiM8vcwD65UDpC25Wg0PY2SD2Zkj0GWiN9R7nM79bwH85VSZ1ncvqzdIeN55Dn4EvIOdgVrD4S9pmj1bnWxwH-wO85UcWeCueRHp4te6mkkSn6EhcrnTDuCkou7H61DIfPL1fJvE8";
+
 
 /* =========================================================
    NORMALIZZAZIONE
@@ -372,6 +377,13 @@ const PROVIDER_CATALOGS = [
     url:
       `${HIGHFLY}/catalog/sport/` +
       `sports_football.json`
+  },
+
+  {
+    source: "flix",
+    url:
+      `${FLIX_FREE}/catalog/tv/` +
+      `dlstreams-sport-all-soccer-events-live.json`
   }
 ];
 
@@ -386,7 +398,9 @@ async function getProviderEvents() {
     await Promise.allSettled(
       PROVIDER_CATALOGS.map(
         item =>
-          getJson(item.url)
+          item.source === "flix"
+            ? getJsonRaw(item.url, 7500)
+            : getJson(item.url)
       )
     );
 
@@ -455,9 +469,9 @@ async function getProviderEvents() {
       String(meta.id),
 
     name:
-      meta.name ||
-      meta.title ||
-      "",
+       source === "flix"
+         ? cleanFlixMatchName(meta.name || meta.title || "")
+         : (meta.name || meta.title || ""),
 
     poster:
       meta.poster ||
@@ -485,6 +499,29 @@ async function getProviderEvents() {
 /* =========================================================
    FILTRO + DEDUPLICAZIONE
 ========================================================= */
+
+// Flix adds league text before ":" and emojis near the teams.
+function cleanFlixMatchName(value = "") {
+  return String(value)
+    .replace(/^[^:]+:\s*/, "")
+    .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, "")
+    .replace(/[\u{1F300}-\u{1FAFF}]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Avoid attaching Flix streams to a different opponent:
+// both full matchup names must agree, not just one well-known team.
+function safeMatchPair(value = "") {
+  const pieces = String(value).split(/\s+vs\.?\s+/i).map(normalize);
+  if (pieces.length !== 2 || !pieces[0] || !pieces[1]) return null;
+  return pieces.sort().join("|");
+}
+
+function isSecondTeamMatch(value = "") {
+  return /\b(?:juventus|milan|inter|roma|bayern|barcelona|real madrid|atletico)\s+(?:ii|iii|b|u23)\b/i.test(value);
+}
+
 
 function getInterestingTeams(name = "") {
 
@@ -641,6 +678,30 @@ async function getCatalogEvents() {
 
 
   for (const event of filtered) {
+
+    // Keep original SV/HF events unchanged. Add Flix as a verified
+    // extra source only when both opponents match the existing event.
+    if (event.source === "flix") {
+      if (isSecondTeamMatch(event.name)) continue;
+      const pair = safeMatchPair(event.name);
+      const matched = pair
+        ? Array.from(map.values()).find(item => safeMatchPair(item.name) === pair)
+        : null;
+
+      if (matched) {
+        matched.providers.push({source: "flix", id: event.providerId});
+      } else if (pair) {
+        map.set("flix:" + event.providerId, {
+          key: "flix:" + event.providerId,
+          name: event.name,
+          poster: event.poster,
+          description: event.description,
+          releaseInfo: event.releaseInfo,
+          providers: [{source: "flix", id: event.providerId}]
+        });
+      }
+      continue;
+    }
 
     const key =
       eventKey(event.name);
@@ -851,10 +912,10 @@ const manifest = {
     "3.0.0",
 
   name:
-    "LIVE TEST",
+    "SV • HF • Flix TEST",
 
   description:
-    "StremVerse + Highfly LIVE Football",
+    "StremVerse + Highfly + Flix-Streams Free soccer events",
 
   resources: [
     "catalog",
@@ -1032,56 +1093,39 @@ app.get(
    STREAM DAL PROVIDER ORIGINALE
 ========================================================= */
 
-async function getStreams(
-  provider
-) {
-
+async function getStreams(provider) {
   let url;
 
-
-  if (
-    provider.source === "sv"
-  ) {
-
-    url =
-      `${STREMVERSE}/stream/tv/` +
-      `${encodeURIComponent(
-        provider.id
-      )}.json`;
-
+  if (provider.source === "sv") {
+    url = `${STREMVERSE}/stream/tv/${encodeURIComponent(provider.id)}.json`;
+  } else if (provider.source === "hf") {
+    url = `${HIGHFLY}/stream/sport/${encodeURIComponent(provider.id)}.json`;
+  } else if (provider.source === "flix") {
+    url = `${FLIX_FREE}/stream/tv/${encodeURIComponent(provider.id)}.json`;
   } else {
-
-    url =
-      `${HIGHFLY}/stream/sport/` +
-      `${encodeURIComponent(
-        provider.id
-      )}.json`;
+    return [];
   }
 
+  const data = provider.source === "flix"
+    ? await getJsonRaw(url, 7500)
+    : await getJson(url);
 
-  const data =
-    await getJson(url);
-
-
-  return (
-    data.streams || []
-  ).map(
-    stream => ({
-
+  return (data.streams || [])
+    // Flix also returns a promotional FlixNest link: exclude it.
+    .filter(stream =>
+      provider.source !== "flix" ||
+      (typeof stream.url === "string" && /^https?:\/\//i.test(stream.url))
+    )
+    .map(stream => ({
       ...stream,
-
       name:
-        provider.source === "sv"
-          ? `StremVerse • ${
-              stream.name ||
-              "Stream"
-            }`
-          : `Highfly • ${
-              stream.name ||
-              "Stream"
-            }`
-    })
-  );
+        (provider.source === "sv"
+          ? "StremVerse"
+          : provider.source === "hf"
+            ? "Highfly"
+            : "Flix-Streams") +
+        " • " + (stream.name || "Stream")
+    }));
 }
 
 
@@ -1297,47 +1341,6 @@ app.get(
 
 
 
-
-/* FLIX_PROBE_TEMP public sports catalog inspection; test only and temporary. */
-(async () => {
-  const base="https://free.flixnest.app/eJyNULtuwzAM_BfOERo4RQbv3bsXAaHIdC1UD4OkHKBF_71ynNZJm6GTIN7xjncfgCRCSb0NGPxESFP9CdoQ8gm7IMpko2AiPWV-g1a50AawZyIUN1C00EKzbfbbfdOYZdv0PiixGbPMz7SDDaxSziq9ZvYk0L6scyNjZjXV2Eh2ru5dxOaz4HCjMNiUKOBiM8vcwD65UDpC25Wg0PY2SD2Zkj0GWiN9R7nM79bwH85VSZ1ncvqzdIeN55Dn4EvIOdgVrD4S9pmj1bnWxwH-wO85UcWeCueRHp4te6mkkSn6EhcrnTDuCkou7H61DIfPL1fJvE8";
-  try {
-    const m = await getJsonRaw(base+"/manifest.json",11000);
-    const cats=Array.isArray(m.catalogs)?m.catalogs:[];
-    console.log("FLIX_PROBE_TEMP_MANIFEST",JSON.stringify({
-      id:m.id,name:m.name,version:m.version,types:m.types,resources:m.resources,
-      catalogs:cats.map(c=>({id:c.id,type:c.type,name:c.name,extra:c.extra})).slice(0,40)
-    }));
-    const sports=cats.filter(c=>/(event|sport|soccer|football|live)/i.test(c.name+" "+c.id) && (c.type==="tv" || c.type==="sport"));
-    for(const c of sports.slice(0,3)){
-      try{
-        const url=base+"/catalog/"+encodeURIComponent(c.type)+"/"+encodeURIComponent(c.id)+".json";
-        const data=await getJsonRaw(url,11000);
-        const sample=(data.metas||[]).slice(0,5).map(x=>({
-          id:x.id,type:x.type,name:x.name,poster:!!x.poster,description:(x.description||"").slice(0,180)
-        }));
-        console.log("FLIX_PROBE_TEMP_CATALOG",JSON.stringify({id:c.id,type:c.type,total:data.metas?.length??0,sample}));
-        if(c.id==="dlstreams-sport-all-soccer-events-live"){
-          const single=(data.metas||[]).find(x=>/\b(inter|milan|napoli|roma|lazio|juventus|barcelona|real madrid|arsenal)\b/i.test(x.name||"")) || (data.metas||[])[0];
-          if(single){
-            try{
-              const streams=await getJsonRaw(base+"/stream/tv/"+encodeURIComponent(single.id)+".json",11000);
-              console.log("FLIX_PROBE_TEMP_STREAM",JSON.stringify({
-                event:single.name,id:single.id,
-                count:(streams.streams||[]).length,
-                items:(streams.streams||[]).slice(0,5).map(x=>({
-                  keys:Object.keys(x),name:x.name,title:(x.title||"").slice(0,130),
-                  url:Boolean(x.url),externalUrl:Boolean(x.externalUrl),
-                  behaviorHints:x.behaviorHints && Object.keys(x.behaviorHints)
-                }))
-              }));
-            }catch(err){console.log("FLIX_PROBE_TEMP_STREAM_ERR",String(err));}
-          }
-        }
-      }catch(e){console.log("FLIX_PROBE_TEMP_CATALOG_ERR",c.id,String(e));}
-    }
-  }catch(e){console.log("FLIX_PROBE_TEMP_MANIFEST_ERR",String(e));}
-})();
 
 /* =========================================================
    ROOT
