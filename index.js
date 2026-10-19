@@ -6,7 +6,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 const STREMVERSE =
-"https://stremverse1.alwaysdata.net/1q1YqqVKyUnItLcovSNUPys9NVaoFAA";
+"https://stremverse1.alwaysdata.net/1q1YqqVKyUgp3DFGqBQA";
 
 const HIGHFLY =
   "https://sports.highfly.to/eyJpbmNsdWRlU3BvcnRzIjpbImZvb3RiYWxsIl19";
@@ -1295,25 +1295,33 @@ app.get(
 
 
 
-/* TEMPORARY read-only timezone options audit; remove immediately after checking. */
+
+/* TEMPORARY: inspect only public event schedule metadata field names. */
 (async () => {
-  for (const path of ["/", "/configure"]) {
-    try {
-      const response = await fetch("https://stremverse1.alwaysdata.net" + path, {
-        signal: AbortSignal.timeout(10000)
-      });
-      const html = await response.text();
-      const selects = [...html.matchAll(/<select\b[^>]*>[\s\S]*?<\/select>/gi)]
-        .map(m => m[0])
-        .filter(x => /timezone|\bWAT\b|\bGMT\b|\bCEST\b|\bCET\b|Europe\/Rome/i.test(x))
-        .map(x => x.replace(/\s+/g, " ").slice(0, 7000));
-      const matches = [...new Set((html.match(/Europe\/Rome|WAT|GMT|CEST|CET|timezoneSelect|timezone/gi)||[]))];
-      console.log("STREMVERSE_TZ_PROBE", JSON.stringify({
-        path, status: response.status, selectors: selects.slice(0,4), matches
-      }));
-    } catch (err) {
-      console.log("STREMVERSE_TZ_PROBE_ERROR", path, String(err));
-    }
+  try {
+    const feed = await getJson(
+      STREMVERSE + "/catalog/tv/stremverse_live_events/genre=Football.json"
+    );
+    const all = Array.isArray(feed.metas) ? feed.metas : [];
+    const sample = all.filter(event =>
+      /monza|cagliari|parma|torino/i.test(event.name || "")
+    ).slice(0, 3);
+    console.log("STREMVERSE_TIME_FIELDS", JSON.stringify({
+      total: all.length,
+      sample: sample.map(event => ({
+        keys: Object.keys(event),
+        name: event.name,
+        releaseInfo: event.releaseInfo,
+        description: String(event.description || "").slice(0, 500),
+        values: Object.fromEntries(
+          Object.entries(event)
+            .filter(([key]) => /date|time|kick|start|end|release|sched/i.test(key))
+            .map(([key,value]) => [key,String(value).slice(0,200)])
+        )
+      }))
+    }));
+  } catch(error) {
+    console.warn("STREMVERSE_TIME_FIELDS_FAILED", String(error));
   }
 })();
 
