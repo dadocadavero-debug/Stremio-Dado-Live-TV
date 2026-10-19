@@ -1317,6 +1317,23 @@ app.get(
           id:x.id,type:x.type,name:x.name,poster:!!x.poster,description:(x.description||"").slice(0,180)
         }));
         console.log("FLIX_PROBE_TEMP_CATALOG",JSON.stringify({id:c.id,type:c.type,total:data.metas?.length??0,sample}));
+        if(c.id==="dlstreams-sport-all-soccer-events-live"){
+          const single=(data.metas||[]).find(x=>/\b(inter|milan|napoli|roma|lazio|juventus|barcelona|real madrid|arsenal)\b/i.test(x.name||"")) || (data.metas||[])[0];
+          if(single){
+            try{
+              const streams=await getJsonRaw(base+"/stream/tv/"+encodeURIComponent(single.id)+".json",11000);
+              console.log("FLIX_PROBE_TEMP_STREAM",JSON.stringify({
+                event:single.name,id:single.id,
+                count:(streams.streams||[]).length,
+                items:(streams.streams||[]).slice(0,5).map(x=>({
+                  keys:Object.keys(x),name:x.name,title:(x.title||"").slice(0,130),
+                  url:Boolean(x.url),externalUrl:Boolean(x.externalUrl),
+                  behaviorHints:x.behaviorHints && Object.keys(x.behaviorHints)
+                }))
+              }));
+            }catch(err){console.log("FLIX_PROBE_TEMP_STREAM_ERR",String(err));}
+          }
+        }
       }catch(e){console.log("FLIX_PROBE_TEMP_CATALOG_ERR",c.id,String(e));}
     }
   }catch(e){console.log("FLIX_PROBE_TEMP_MANIFEST_ERR",String(e));}
