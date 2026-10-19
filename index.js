@@ -954,7 +954,7 @@ const manifest = {
     "Top Club Europei & Nazionali",
 
   logo:
-    "https://stremio-live-test-20261019.onrender.com/logo.png",
+    "https://dado-live-tv.onrender.com/logo.png",
 
   resources: [
     "catalog",
