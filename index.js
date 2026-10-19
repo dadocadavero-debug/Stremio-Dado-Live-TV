@@ -790,7 +790,7 @@ function eventToMeta(event) {
   return {
 
     id:
-      `live:${encodeEventId(
+      `live_test:${encodeEventId(
         event.key
       )}`,
 
@@ -825,13 +825,13 @@ function eventToMeta(event) {
 const manifest = {
 
   id:
-    "community.stremio.live.football",
+    "community.stremio.live.football.test",
 
   version:
     "3.0.0",
 
   name:
-    "LIVE",
+    "LIVE TEST",
 
   description:
     "StremVerse + Highfly LIVE Football",
@@ -855,12 +855,12 @@ const manifest = {
         "live_football_v5",
 
       name:
-        "🔴 LIVE Football ⚽"
+        "🧪 LIVE Football TEST ⚽"
     }
   ],
 
   idPrefixes: [
-    "live:"
+    "live_test:"
   ]
 };
 
@@ -925,7 +925,7 @@ async function findEvent(id) {
 
   if (
     !id ||
-    !id.startsWith("live:")
+    !id.startsWith("live_test:")
   ) {
 
     return null;
@@ -934,7 +934,7 @@ async function findEvent(id) {
 
   const key =
     decodeEventId(
-      id.substring(5)
+      id.substring(10)
     );
 
 
