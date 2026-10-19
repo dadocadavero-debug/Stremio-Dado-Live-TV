@@ -1293,6 +1293,31 @@ app.get(
 );
 
 
+
+/* TEMPORARY diagnostic of publicly served StremVerse configuration markup.
+   Test branch only; contains no account tokens. Remove after inspecting. */
+(async () => {
+  try {
+    const response = await fetch("https://stremverse1.alwaysdata.net/", {
+      signal: AbortSignal.timeout(10000),
+      headers: {"User-Agent":"Stremio-LIVE-test-config-check"}
+    });
+    const html = await response.text();
+    const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/g)]
+      .map(item => item[1]).slice(0, 20);
+    const points = ["timezone", "manifest", "generate", "configure", "fetch("];
+    const extracts = points.map(word => {
+      const at = html.toLowerCase().indexOf(word);
+      return {word, html: at < 0 ? "" : html.slice(Math.max(0, at-300), at+850)};
+    });
+    console.log("TEST_SV_CONFIG_PROBE", JSON.stringify({
+      status: response.status, length: html.length, scripts, extracts
+    }));
+  } catch (error) {
+    console.log("TEST_SV_CONFIG_PROBE_FAIL", String(error));
+  }
+})();
+
 /* =========================================================
    ROOT
 ========================================================= */
