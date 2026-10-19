@@ -9,7 +9,7 @@ const STREMVERSE =
 "https://stremverse1.alwaysdata.net/1q1YqqVKyUgp3DFGqBQA";
 
 const HIGHFLY =
-  "https://sports.highfly.dev/eyJpbmNsdWRlU3BvcnRzIjpbImZvb3RiYWxsIl19";
+  "https://sports.highfly.to/eyJpbmNsdWRlU3BvcnRzIjpbImZvb3RiYWxsIl19";
 
 
 /* =========================================================
