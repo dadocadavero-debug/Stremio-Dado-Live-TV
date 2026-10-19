@@ -909,13 +909,16 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.0.0",
+    "3.0.1",
 
   name:
-    "SV • HF • Flix TEST",
+    "Dado Live TV",
 
   description:
-    "StremVerse + Highfly + Flix-Streams Free soccer events",
+    "Top Club Europei & Nazionali",
+
+  logo:
+    "https://stremio-live-test-20261019.onrender.com/logo.jpg",
 
   resources: [
     "catalog",
@@ -936,7 +939,7 @@ const manifest = {
         "live_football_v5",
 
       name:
-        "🧪 LIVE Football TEST ⚽"
+        "🔴 Live Football ⚽"
     }
   ],
 
@@ -958,6 +961,14 @@ app.get(
   }
 );
 
+
+/* =========================================================
+   LOGO PERSONALIZZATO DADO LIVE TV
+========================================================= */
+app.get("/logo.jpg", (req, res) => {
+  res.type("jpeg");
+  res.sendFile(require("path").join(__dirname, "assets", "dado-live-tv.jpg"));
+});
 
 /* =========================================================
    CATALOGO
