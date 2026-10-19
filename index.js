@@ -522,6 +522,9 @@ async function getProviderEvents() {
          ? cleanFlixMatchName(meta.name || meta.title || "")
          : (meta.name || meta.title || ""),
 
+    rawName:
+      source === "flix" ? String(meta.name || meta.title || "") : "",
+
     poster:
       meta.poster ||
       meta.background ||
@@ -557,6 +560,29 @@ function cleanFlixMatchName(value = "") {
     .replace(/[\u{1F300}-\u{1FAFF}]/gu, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// Flix sometimes removes the competition from the public match name.
+// Keep women's/youth competitions excluded using its original title and
+// the poster's encoded title (e.g. Frauen-Bundesliga: Bayern vs Stuttgart).
+function flixPosterTitle(poster = "") {
+  const match = String(poster || "").match(/[?&]title=([^&#]+)/i);
+  if (!match) return "";
+  try {
+    return decodeURIComponent(match[1].replace(/\+/g, " "));
+  } catch {
+    return "";
+  }
+}
+
+function wantedProviderEvent(event) {
+  if (!event?.name || !wantedEvent(event.name)) return false;
+  if (event.source !== "flix") return true;
+
+  // Check categorical evidence, not only the shortened matchup title.
+  // Unknown titles are kept to avoid excluding legitimate men's fixtures.
+  return !unwanted(event.rawName || "") &&
+    !unwanted(flixPosterTitle(event.poster));
 }
 
 // Avoid attaching Flix streams to a different opponent:
@@ -711,11 +737,7 @@ async function getCatalogEvents() {
 
 
   const filtered =
-    all.filter(
-      event =>
-        event.name &&
-        wantedEvent(event.name)
-    );
+    all.filter(wantedProviderEvent);
 
 
   /*
@@ -1393,11 +1415,11 @@ app.get(
     res.set("Cache-Control", "no-store, no-cache, must-revalidate");
     try {
       const all = await getProviderEvents();
-      const passed = all.filter(e => wantedEvent(e.name));
-      const excluded = all.filter(e => !wantedEvent(e.name));
+      const passed = all.filter(wantedProviderEvent);
+      const excluded = all.filter(e => !wantedProviderEvent(e));
 
       res.json({
-        versioneFiltro: "reserve-aware-20261019-v2",
+        versioneFiltro: "reserve-aware-20261019-v3",
         generatoAlle: new Date().toISOString(),
         autoTest: {
           "Inter vs Ajax II": wantedEvent("Inter vs Ajax II"),
@@ -1405,7 +1427,15 @@ app.get(
           "Ajax II vs De Graafschap": wantedEvent("Ajax II vs De Graafschap"),
           "PSV II vs Dordrecht": wantedEvent("PSV II vs Dordrecht"),
           "Juventus II vs Renate": wantedEvent("Juventus II vs Renate"),
-          "Liga Portugal Betclic": wantedEvent("Liga Portugal Betclic")
+          "Liga Portugal Betclic": wantedEvent("Liga Portugal Betclic"),
+          "Flix Frauen-Bundesliga: Bayern vs Stuttgart": wantedProviderEvent({
+            source: "flix", name: "Bayern vs Stuttgart",
+            rawName: "Frauen-Bundesliga: Bayern vs Stuttgart"
+          }),
+          "Flix Bundesliga: Bayern vs Stuttgart": wantedProviderEvent({
+            source: "flix", name: "Bayern vs Stuttgart",
+            rawName: "Bundesliga: Bayern vs Stuttgart"
+          })
         },
         totale: all.length,
         passati: passed.map(e => e.name),
@@ -1416,11 +1446,15 @@ app.get(
           .map(e => ({
             fonte: e.source,
             nome: e.name,
-            ammessa: wantedEvent(e.name),
+            ammessa: wantedProviderEvent(e),
+            titoloOriginale: e.rawName || "",
+            titoloLocandina: flixPosterTitle(e.poster),
             descrizione: String(e.description || "").slice(0, 220)
           })),
         riconosciutiComeIndesiderati: all
-          .filter(e => unwanted(e.name))
+          .filter(e => unwanted(e.name) || !wantedProviderEvent(e) &&
+            e.source === "flix" &&
+            (unwanted(e.rawName || "") || unwanted(flixPosterTitle(e.poster))))
           .map(e => e.name)
       });
     } catch (error) {
