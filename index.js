@@ -1305,13 +1305,13 @@ app.get(
     const html = await response.text();
     const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/g)]
       .map(item => item[1]).slice(0, 20);
-    const points = ["timezone", "manifest", "generate", "configure", "fetch("];
+    const points = ["timezone", "manifest", "generate", "configure", "fetch(", "timezoneSelect", "generateConfig", "configUrl", "api/manifest"];
     const extracts = points.map(word => {
       const at = html.toLowerCase().indexOf(word);
       return {word, html: at < 0 ? "" : html.slice(Math.max(0, at-300), at+850)};
     });
     console.log("TEST_SV_CONFIG_PROBE", JSON.stringify({
-      status: response.status, length: html.length, scripts, extracts
+      status: response.status, length: html.length, scripts, extracts, tail: html.slice(-11500)
     }));
   } catch (error) {
     console.log("TEST_SV_CONFIG_PROBE_FAIL", String(error));
