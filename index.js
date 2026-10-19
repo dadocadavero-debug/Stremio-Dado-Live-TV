@@ -1294,6 +1294,29 @@ app.get(
 
 
 
+
+/* TEMPORARY read-only timezone options audit; remove immediately after checking. */
+(async () => {
+  for (const path of ["/", "/configure"]) {
+    try {
+      const response = await fetch("https://stremverse1.alwaysdata.net" + path, {
+        signal: AbortSignal.timeout(10000)
+      });
+      const html = await response.text();
+      const selects = [...html.matchAll(/<select\b[^>]*>[\s\S]*?<\/select>/gi)]
+        .map(m => m[0])
+        .filter(x => /timezone|\bWAT\b|\bGMT\b|\bCEST\b|\bCET\b|Europe\/Rome/i.test(x))
+        .map(x => x.replace(/\s+/g, " ").slice(0, 7000));
+      const matches = [...new Set((html.match(/Europe\/Rome|WAT|GMT|CEST|CET|timezoneSelect|timezone/gi)||[]))];
+      console.log("STREMVERSE_TZ_PROBE", JSON.stringify({
+        path, status: response.status, selectors: selects.slice(0,4), matches
+      }));
+    } catch (err) {
+      console.log("STREMVERSE_TZ_PROBE_ERROR", path, String(err));
+    }
+  }
+})();
+
 /* =========================================================
    ROOT
 ========================================================= */
