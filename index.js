@@ -288,8 +288,13 @@ function wantedEvent(name = "") {
    FETCH JSON
 ========================================================= */
 
-async function getJsonRaw(url, timeoutMs = 12000) {
+async function getJsonRaw(url, timeoutMs = 12000, parentSignal = null) {
   const controller = new AbortController();
+  const abortFromParent = () => controller.abort();
+  if (parentSignal) {
+    if (parentSignal.aborted) controller.abort();
+    else parentSignal.addEventListener("abort", abortFromParent, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -305,39 +310,70 @@ async function getJsonRaw(url, timeoutMs = 12000) {
     return await response.json();
   } finally {
     clearTimeout(timer);
+    if (parentSignal) parentSignal.removeEventListener("abort", abortFromParent);
   }
 }
 
-// Prefer the primary Highfly domain; keep the original football configuration.
+// Try a backup if the preferred Highfly host is still slow after 2.5 seconds.
+// The first successful JSON response wins; outstanding requests are aborted.
+// A responsive primary host does not trigger any backup traffic.
 async function getJson(url) {
   if (!url.startsWith(`${HIGHFLY}/`)) {
     return getJsonRaw(url);
   }
 
   const suffix = url.slice(HIGHFLY.length);
-  const bases = [
-    ...new Set([preferredHighflyBase, HIGHFLY, ...HIGHFLY_BACKUPS])
-  ];
+  const bases = [...new Set([preferredHighflyBase, HIGHFLY, ...HIGHFLY_BACKUPS])];
+  const controller = new AbortController();
+  const timers = [];
+  const started = Array(bases.length).fill(false);
+  let completed = 0;
+  let settled = false;
   let lastError;
 
-  for (const base of bases) {
-    try {
-      const json = await getJsonRaw(
-        `${base}${suffix}`,
-        base === HIGHFLY ? 8000 : 5000
-      );
-      if (preferredHighflyBase !== base) {
-        console.log("Highfly source switched to", base.split("/")[2]);
-        preferredHighflyBase = base;
-      }
-      return json;
-    } catch (error) {
-      lastError = error;
-      console.warn("Highfly source unreachable:", base.split("/")[2], String(error));
-    }
-  }
+  try {
+    return await new Promise((resolve, reject) => {
+      function launch(index) {
+        if (settled || started[index]) return;
+        started[index] = true;
+        const base = bases[index];
 
-  throw lastError || new Error("All Highfly servers unavailable");
+        getJsonRaw(
+          `${base}${suffix}`,
+          base === HIGHFLY ? 8000 : 5000,
+          controller.signal
+        ).then(json => {
+          if (settled) return;
+          settled = true;
+          if (preferredHighflyBase !== base) {
+            console.log("Highfly source switched to", base.split("/")[2]);
+            preferredHighflyBase = base;
+          }
+          resolve(json);
+          controller.abort();
+        }).catch(error => {
+          if (settled) return;
+          lastError = error;
+          completed += 1;
+          console.warn("Highfly source unreachable:", base.split("/")[2], String(error));
+          const next = started.findIndex(value => !value);
+          if (next !== -1) launch(next);
+          else if (completed === bases.length) {
+            settled = true;
+            reject(lastError);
+          }
+        });
+      }
+
+      launch(0);
+      for (let i = 1; i < bases.length; i++) {
+        timers.push(setTimeout(() => launch(i), i * 2500));
+      }
+    });
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+    controller.abort();
+  }
 }
 
 
@@ -909,7 +945,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.0.3",
+    "3.1.0",
 
   name:
     "Dado Live TV",
@@ -1142,95 +1178,139 @@ async function getStreams(provider) {
 
 
 /* =========================================================
+   STREAM RESPONSE CACHE & SOURCE TIMING
+========================================================= */
+
+// A short cache avoids repeated link resolution during a playback retry.
+// Do not cache signed live URLs for minutes: they can expire quickly.
+const STREAM_CACHE_MS = 15 * 1000;
+const STREAM_CACHE_MAX_ENTRIES = 80;
+const streamCache = new Map();
+const streamInFlight = new Map();
+const streamTimings = {
+  sv: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 },
+  hf: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 },
+  flix: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 }
+};
+
+function readCachedStreams(id) {
+  const cached = streamCache.get(id);
+  if (!cached) return null;
+  if (cached.expires > Date.now()) return cached.streams;
+  streamCache.delete(id);
+  return null;
+}
+
+function recordStreamTiming(source, milliseconds, successful, count) {
+  const timing = streamTimings[source];
+  if (!timing) return;
+  timing.requests += 1;
+  timing.totalMs += milliseconds;
+  timing.lastMs = milliseconds;
+  if (!successful) timing.failures += 1;
+  else if (count === 0) timing.empty += 1;
+}
+
+async function collectStreams(event) {
+  // Keep all providers and their original Stremio stream objects intact.
+  const results = await Promise.allSettled(
+    event.providers.map(async provider => {
+      const started = Date.now();
+      try {
+        const streams = await getStreams(provider);
+        recordStreamTiming(provider.source, Date.now() - started, true, streams.length);
+        return streams;
+      } catch (error) {
+        recordStreamTiming(provider.source, Date.now() - started, false, 0);
+        throw error;
+      }
+    })
+  );
+
+  const streams = results.flatMap(result =>
+    result.status === "fulfilled" ? result.value : []
+  );
+
+  // Deduplicate without changing source order, headers or playback hints.
+  const unique = [];
+  const seen = new Set();
+  for (const stream of streams) {
+    const key = stream.url || stream.externalUrl || stream.ytId || JSON.stringify(stream);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(stream);
+  }
+  return unique;
+}
+
+async function getCachedStreams(id, event) {
+  const cached = readCachedStreams(id);
+  if (cached) return cached;
+  if (streamInFlight.has(id)) return streamInFlight.get(id);
+
+  const loading = collectStreams(event)
+    .then(streams => {
+      // Do not cache an empty list: an unavailable provider may recover.
+      if (streams.length) {
+        for (const [key, value] of streamCache) {
+          if (value.expires <= Date.now()) streamCache.delete(key);
+        }
+        while (streamCache.size >= STREAM_CACHE_MAX_ENTRIES) {
+          streamCache.delete(streamCache.keys().next().value);
+        }
+        streamCache.set(id, { expires: Date.now() + STREAM_CACHE_MS, streams });
+      }
+      return streams;
+    })
+    .finally(() => streamInFlight.delete(id));
+
+  streamInFlight.set(id, loading);
+  return loading;
+}
+
+
+/* =========================================================
    STREAM ROUTE
 ========================================================= */
 
-app.get(
-  "/stream/tv/:id.json",
-  async (req, res) => {
+app.get("/stream/tv/:id.json", async (req, res) => {
+  try {
+    // Fast path avoids even a catalog refresh for an immediate retry.
+    const cached = readCachedStreams(req.params.id);
+    if (cached) return res.json({ streams: cached });
 
-    try {
+    const event = await findEvent(req.params.id);
+    if (!event) return res.json({ streams: [] });
 
-      const event =
-        await findEvent(
-          req.params.id
-        );
-
-
-      if (!event) {
-
-        return res.json({
-          streams: []
-        });
-      }
-
-
-      const results =
-        await Promise.allSettled(
-          event.providers.map(
-            getStreams
-          )
-        );
-
-
-      const streams =
-        results.flatMap(
-          result =>
-            result.status ===
-            "fulfilled"
-              ? result.value
-              : []
-        );
-
-
-      /*
-        Deduplicazione degli stream.
-      */
-
-      const unique = [];
-      const seen = new Set();
-
-
-      for (
-        const stream of streams
-      ) {
-
-        const key =
-          stream.url ||
-          stream.externalUrl ||
-          stream.ytId ||
-          JSON.stringify(stream);
-
-
-        if (seen.has(key)) {
-          continue;
-        }
-
-
-        seen.add(key);
-        unique.push(stream);
-      }
-
-
-      res.json({
-        streams: unique
-      });
-
-
-    } catch (error) {
-
-      console.error(
-        "Stream error:",
-        error
-      );
-
-
-      res.json({
-        streams: []
-      });
-    }
+    const streams = await getCachedStreams(req.params.id, event);
+    res.json({ streams });
+  } catch (error) {
+    console.error("Stream error:", error);
+    res.json({ streams: [] });
   }
-);
+});
+
+// Measured time to obtain stream lists, NOT media buffering/playback times.
+app.get("/debug/stream-performance", (req, res) => {
+  const sources = {};
+  for (const [name, stats] of Object.entries(streamTimings)) {
+    sources[name] = {
+      requests: stats.requests,
+      failures: stats.failures,
+      empty: stats.empty,
+      averageResponseMs: stats.requests
+        ? Math.round(stats.totalMs / stats.requests) : null,
+      lastResponseMs: stats.requests ? stats.lastMs : null
+    };
+  }
+  res.json({
+    version: "3.1.0",
+    note: "Metrics measure stream-link fetching, not playback start or buffering.",
+    streamCacheSeconds: STREAM_CACHE_MS / 1000,
+    cachedEvents: streamCache.size,
+    sources
+  });
+});
 
 
 /* =========================================================
