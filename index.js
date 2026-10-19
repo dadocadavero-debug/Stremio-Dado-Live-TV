@@ -1297,6 +1297,31 @@ app.get(
 
 
 
+
+/* FLIX_PROBE_TEMP public sports catalog inspection; test only and temporary. */
+(async () => {
+  const base="https://free.flixnest.app/eJyNULtuwzAM_BfOERo4RQbv3bsXAaHIdC1UD4OkHKBF_71ynNZJm6GTIN7xjncfgCRCSb0NGPxESFP9CdoQ8gm7IMpko2AiPWV-g1a50AawZyIUN1C00EKzbfbbfdOYZdv0PiixGbPMz7SDDaxSziq9ZvYk0L6scyNjZjXV2Eh2ru5dxOaz4HCjMNiUKOBiM8vcwD65UDpC25Wg0PY2SD2Zkj0GWiN9R7nM79bwH85VSZ1ncvqzdIeN55Dn4EvIOdgVrD4S9pmj1bnWxwH-wO85UcWeCueRHp4te6mkkSn6EhcrnTDuCkou7H61DIfPL1fJvE8";
+  try {
+    const m = await getJsonRaw(base+"/manifest.json",11000);
+    const cats=Array.isArray(m.catalogs)?m.catalogs:[];
+    console.log("FLIX_PROBE_TEMP_MANIFEST",JSON.stringify({
+      id:m.id,name:m.name,version:m.version,types:m.types,resources:m.resources,
+      catalogs:cats.map(c=>({id:c.id,type:c.type,name:c.name,extra:c.extra})).slice(0,40)
+    }));
+    const sports=cats.filter(c=>/(event|sport|soccer|football|live)/i.test(c.name+" "+c.id) && (c.type==="tv" || c.type==="sport"));
+    for(const c of sports.slice(0,3)){
+      try{
+        const url=base+"/catalog/"+encodeURIComponent(c.type)+"/"+encodeURIComponent(c.id)+".json";
+        const data=await getJsonRaw(url,11000);
+        const sample=(data.metas||[]).slice(0,5).map(x=>({
+          id:x.id,type:x.type,name:x.name,poster:!!x.poster,description:(x.description||"").slice(0,180)
+        }));
+        console.log("FLIX_PROBE_TEMP_CATALOG",JSON.stringify({id:c.id,type:c.type,total:data.metas?.length??0,sample}));
+      }catch(e){console.log("FLIX_PROBE_TEMP_CATALOG_ERR",c.id,String(e));}
+    }
+  }catch(e){console.log("FLIX_PROBE_TEMP_MANIFEST_ERR",String(e));}
+})();
+
 /* =========================================================
    ROOT
 ========================================================= */
