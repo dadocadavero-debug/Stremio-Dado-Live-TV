@@ -1296,35 +1296,6 @@ app.get(
 
 
 
-/* TEMPORARY: inspect only public event schedule metadata field names. */
-(async () => {
-  try {
-    const feed = await getJson(
-      STREMVERSE + "/catalog/tv/stremverse_live_events/genre=Football.json"
-    );
-    const all = Array.isArray(feed.metas) ? feed.metas : [];
-    const sample = all.filter(event =>
-      /monza|cagliari|parma|torino/i.test(event.name || "")
-    ).slice(0, 3);
-    console.log("STREMVERSE_TIME_FIELDS", JSON.stringify({
-      total: all.length,
-      sample: sample.map(event => ({
-        keys: Object.keys(event),
-        name: event.name,
-        releaseInfo: event.releaseInfo,
-        description: String(event.description || "").slice(0, 500),
-        values: Object.fromEntries(
-          Object.entries(event)
-            .filter(([key]) => /date|time|kick|start|end|release|sched/i.test(key))
-            .map(([key,value]) => [key,String(value).slice(0,200)])
-        )
-      }))
-    }));
-  } catch(error) {
-    console.warn("STREMVERSE_TIME_FIELDS_FAILED", String(error));
-  }
-})();
-
 /* =========================================================
    ROOT
 ========================================================= */
