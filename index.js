@@ -9,7 +9,7 @@ const STREMVERSE =
 "https://stremverse1.alwaysdata.net/1q1YqqVKyUgp3DFGqBQA";
 
 const HIGHFLY =
-  "https://sports.highfly.to/eyJpbmNsdWRlU3BvcnRzIjpbImZvb3RiYWxsIl19";
+  "https://sports.highfly.to/eyJpbmNsdWRlU3BvcnRzIjpbImZvb3RiYWxsIl0sImZyZWVVc2VySWQiOiI5ZTQ1YzZkNC1mMzBkLTQ3MTQtYmJjMy0wNzhjNmFiOTU1NzIuM2FkYzViYTE3YTE0NmUyMiJ9";
 
 const HIGHFLY_BACKUPS = [
   "https://sportsfree.highfly.to/eyJpbmNsdWRlU3BvcnRzIjpbImZvb3RiYWxsIl19",
