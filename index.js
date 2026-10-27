@@ -18,11 +18,6 @@ const HIGHFLY_BACKUPS = [
 
 let preferredHighflyBase = HIGHFLY;
 
-// Shared, non-personal Flix-Streams Free soccer configuration.
-// No user install ID, subscriber access or film catalog is included.
-const FLIX_FREE =
-  "https://free.flixnest.app/eJyNULtuwzAM_BfOERo4RQbv3bsXAaHIdC1UD4OkHKBF_71ynNZJm6GTIN7xjncfgCRCSb0NGPxESFP9CdoQ8gm7IMpko2AiPWV-g1a50AawZyIUN1C00EKzbfbbfdOYZdv0PiixGbPMz7SDDaxSziq9ZvYk0L6scyNjZjXV2Eh2ru5dxOaz4HCjMNiUKOBiM8vcwD65UDpC25Wg0PY2SD2Zkj0GWiN9R7nM79bwH85VSZ1ncvqzdIeN55Dn4EvIOdgVrD4S9pmj1bnWxwH-wO85UcWeCueRHp4te6mkkSn6EhcrnTDuCkou7H61DIfPL1fJvE8";
-
 
 /* =========================================================
    NORMALIZZAZIONE
@@ -426,13 +421,6 @@ const PROVIDER_CATALOGS = [
     url:
       `${HIGHFLY}/catalog/sport/` +
       `sports_football.json`
-  },
-
-  {
-    source: "flix",
-    url:
-      `${FLIX_FREE}/catalog/tv/` +
-      `dlstreams-sport-all-soccer-events-live.json`
   }
 ];
 
@@ -445,12 +433,7 @@ async function getProviderEvents() {
 
   const results =
     await Promise.allSettled(
-      PROVIDER_CATALOGS.map(
-        item =>
-          item.source === "flix"
-            ? getJsonRaw(item.url, 7500)
-            : getJson(item.url)
-      )
+      PROVIDER_CATALOGS.map(item => getJson(item.url))
     );
 
 
@@ -517,13 +500,7 @@ async function getProviderEvents() {
     providerId:
       String(meta.id),
 
-    name:
-       source === "flix"
-         ? cleanFlixMatchName(meta.name || meta.title || "")
-         : (meta.name || meta.title || ""),
-
-    rawName:
-      source === "flix" ? String(meta.name || meta.title || "") : "",
+    name: meta.name || meta.title || "",
 
     poster:
       meta.poster ||
@@ -552,45 +529,8 @@ async function getProviderEvents() {
    FILTRO + DEDUPLICAZIONE
 ========================================================= */
 
-// Flix adds league text before ":" and emojis near the teams.
-function cleanFlixMatchName(value = "") {
-  return String(value)
-    .replace(/^[^:]+:\s*/, "")
-    .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, "")
-    .replace(/[\u{1F300}-\u{1FAFF}]/gu, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// Flix sometimes removes the competition from the public match name.
-// Keep women's/youth competitions excluded using its original title and
-// the poster's encoded title (e.g. Frauen-Bundesliga: Bayern vs Stuttgart).
-function flixPosterTitle(poster = "") {
-  const match = String(poster || "").match(/[?&]title=([^&#]+)/i);
-  if (!match) return "";
-  try {
-    return decodeURIComponent(match[1].replace(/\+/g, " "));
-  } catch {
-    return "";
-  }
-}
-
 function wantedProviderEvent(event) {
-  if (!event?.name || !wantedEvent(event.name)) return false;
-  if (event.source !== "flix") return true;
-
-  // Check categorical evidence, not only the shortened matchup title.
-  // Unknown titles are kept to avoid excluding legitimate men's fixtures.
-  return !unwanted(event.rawName || "") &&
-    !unwanted(flixPosterTitle(event.poster));
-}
-
-// Avoid attaching Flix streams to a different opponent:
-// both full matchup names must agree, not just one well-known team.
-function safeMatchPair(value = "") {
-  const pieces = String(value).split(/\s+vs\.?\s+/i).map(normalize);
-  if (pieces.length !== 2 || !pieces[0] || !pieces[1]) return null;
-  return pieces.sort().join("|");
+  return !!event?.name && wantedEvent(event.name);
 }
 
 function isSecondTeamMatch(value = "") {
@@ -749,31 +689,6 @@ async function getCatalogEvents() {
 
 
   for (const event of filtered) {
-
-    // Keep original SV/HF events unchanged. Add Flix as a verified
-    // extra source only when both opponents match the existing event.
-    if (event.source === "flix") {
-      // The shared filter already excludes matches without a selected first team.
-      // Do not discard Inter vs Ajax II merely because Flix is the provider.
-      const pair = safeMatchPair(event.name);
-      const matched = pair
-        ? Array.from(map.values()).find(item => safeMatchPair(item.name) === pair)
-        : null;
-
-      if (matched) {
-        matched.providers.push({source: "flix", id: event.providerId});
-      } else if (pair) {
-        map.set("flix:" + event.providerId, {
-          key: "flix:" + event.providerId,
-          name: event.name,
-          poster: event.poster,
-          description: event.description,
-          releaseInfo: event.releaseInfo,
-          providers: [{source: "flix", id: event.providerId}]
-        });
-      }
-      continue;
-    }
 
     const key =
       eventKey(event.name);
@@ -1184,32 +1099,17 @@ async function getStreams(provider) {
     url = `${STREMVERSE}/stream/tv/${encodeURIComponent(provider.id)}.json`;
   } else if (provider.source === "hf") {
     url = `${HIGHFLY}/stream/sport/${encodeURIComponent(provider.id)}.json`;
-  } else if (provider.source === "flix") {
-    url = `${FLIX_FREE}/stream/tv/${encodeURIComponent(provider.id)}.json`;
   } else {
     return [];
   }
 
-  const data = provider.source === "flix"
-    ? await getJsonRaw(url, 7500)
-    : await getJson(url);
+  const data = await getJson(url);
 
-  return (data.streams || [])
-    // Flix also returns a promotional FlixNest link: exclude it.
-    .filter(stream =>
-      provider.source !== "flix" ||
-      (typeof stream.url === "string" && /^https?:\/\//i.test(stream.url))
-    )
-    .map(stream => ({
-      ...stream,
-      name:
-        (provider.source === "sv"
-          ? "StremVerse"
-          : provider.source === "hf"
-            ? "Highfly"
-            : "Flix-Streams") +
-        " • " + (stream.name || "Stream")
-    }));
+  return (data.streams || []).map(stream => ({
+    ...stream,
+    name: (provider.source === "sv" ? "StremVerse" : "Highfly") +
+      " • " + (stream.name || "Stream")
+  }));
 }
 
 
@@ -1225,8 +1125,7 @@ const streamCache = new Map();
 const streamInFlight = new Map();
 const streamTimings = {
   sv: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 },
-  hf: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 },
-  flix: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 }
+  hf: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 }
 };
 
 function readCachedStreams(id) {
@@ -1427,15 +1326,7 @@ app.get(
           "Ajax II vs De Graafschap": wantedEvent("Ajax II vs De Graafschap"),
           "PSV II vs Dordrecht": wantedEvent("PSV II vs Dordrecht"),
           "Juventus II vs Renate": wantedEvent("Juventus II vs Renate"),
-          "Liga Portugal Betclic": wantedEvent("Liga Portugal Betclic"),
-          "Flix Frauen-Bundesliga: Bayern vs Stuttgart": wantedProviderEvent({
-            source: "flix", name: "Bayern vs Stuttgart",
-            rawName: "Frauen-Bundesliga: Bayern vs Stuttgart"
-          }),
-          "Flix Bundesliga: Bayern vs Stuttgart": wantedProviderEvent({
-            source: "flix", name: "Bayern vs Stuttgart",
-            rawName: "Bundesliga: Bayern vs Stuttgart"
-          })
+          "Liga Portugal Betclic": wantedEvent("Liga Portugal Betclic")
         },
         totale: all.length,
         passati: passed.map(e => e.name),
@@ -1447,14 +1338,10 @@ app.get(
             fonte: e.source,
             nome: e.name,
             ammessa: wantedProviderEvent(e),
-            titoloOriginale: e.rawName || "",
-            titoloLocandina: flixPosterTitle(e.poster),
             descrizione: String(e.description || "").slice(0, 220)
           })),
         riconosciutiComeIndesiderati: all
-          .filter(e => unwanted(e.name) || !wantedProviderEvent(e) &&
-            e.source === "flix" &&
-            (unwanted(e.rawName || "") || unwanted(flixPosterTitle(e.poster))))
+          .filter(e => unwanted(e.name))
           .map(e => e.name)
       });
     } catch (error) {
