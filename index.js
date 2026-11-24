@@ -18,6 +18,24 @@ const HIGHFLY_BACKUPS = [
 
 let preferredHighflyBase = HIGHFLY;
 
+// Keep the configured manifest (which may include proxy credentials) out of Git.
+const EASYSPORTS_MANIFEST_URL = process.env.EASYSPORTS_MANIFEST_URL || "";
+let easySportsCatalogCache = { expires: 0, catalogs: [] };
+
+function easySportsBase() {
+  if (!EASYSPORTS_MANIFEST_URL) return null;
+  try {
+    const url = new URL(EASYSPORTS_MANIFEST_URL);
+    if (url.protocol !== "https:" ||
+        url.hostname !== "easysports.realbestia.com" ||
+        !url.pathname.endsWith("/manifest.json") ||
+        url.search || url.hash) return null;
+    return url.href.slice(0, -"/manifest.json".length);
+  } catch {
+    return null;
+  }
+}
+
 
 /* =========================================================
    NORMALIZZAZIONE
@@ -429,12 +447,64 @@ const PROVIDER_CATALOGS = [
    RECUPERO EVENTI
 ========================================================= */
 
+// Discover the catalog IDs and types from the configured Stremio manifest.
+// The existing event filter remains responsible for selecting the wanted teams.
+async function getEasySportsCatalogs() {
+  const base = easySportsBase();
+  if (!base) return [];
+  if (easySportsCatalogCache.expires > Date.now()) {
+    return easySportsCatalogCache.catalogs;
+  }
+  try {
+    const manifest = await getJsonRaw(`${base}/manifest.json`, 6000);
+    const catalogs = [];
+    for (const catalog of manifest.catalogs || []) {
+      if (!catalog?.id || !catalog.type) continue;
+      const extras = Array.isArray(catalog.extra) ? catalog.extra : [];
+      const genre = extras.find(extra => extra.name === "genre");
+      const football = genre?.options?.find(option =>
+        /football|soccer|calcio|f[uú]tbol/i.test(String(option)) &&
+        !/american|americano/i.test(String(option))
+      );
+      const required = [...extras.filter(extra => extra.isRequired).map(extra => extra.name),
+        ...(catalog.extraRequired || [])];
+      if (required.some(name => name !== "genre" || !football)) continue;
+      const suffix = football ? `/genre=${encodeURIComponent(football)}` : "";
+      catalogs.push({
+        source: "es",
+        type: catalog.type,
+        url: `${base}/catalog/${encodeURIComponent(catalog.type)}/${encodeURIComponent(catalog.id)}${suffix}.json`,
+        priority: /football|soccer|calcio|f[uú]tbol|live|today|sport/i.test(
+          `${catalog.id} ${catalog.name || ""}`
+        ) || !!football
+      });
+    }
+    const preferred = catalogs.filter(catalog => catalog.priority);
+    const selected = preferred.length ? preferred : catalogs;
+    easySportsCatalogCache = {
+      expires: Date.now() + 5 * 60 * 1000,
+      catalogs: selected
+    };
+    return selected;
+  } catch {
+    // Never log the configured manifest URL or its credentials.
+    console.warn("EasySports manifest unavailable");
+    return [];
+  }
+}
+
 async function getProviderEvents() {
 
-  const results =
-    await Promise.allSettled(
-      PROVIDER_CATALOGS.map(item => getJson(item.url))
-    );
+  // Start the existing providers immediately, even while discovering EasySports.
+  const existingResults = Promise.allSettled(
+    PROVIDER_CATALOGS.map(item => getJson(item.url))
+  );
+  const easyCatalogs = await getEasySportsCatalogs();
+  const catalogs = [...PROVIDER_CATALOGS, ...easyCatalogs];
+  const results = [
+    ...await existingResults,
+    ...await Promise.allSettled(easyCatalogs.map(item => getJsonRaw(item.url, 6000)))
+  ];
 
 
   // An outage in every provider must not replace an existing catalog with an empty one.
@@ -456,7 +526,7 @@ async function getProviderEvents() {
 
         console.error(
           "Provider error:",
-          PROVIDER_CATALOGS[index].url
+          catalogs[index].source
         );
 
         return;
@@ -464,7 +534,7 @@ async function getProviderEvents() {
 
 
       const source =
-        PROVIDER_CATALOGS[index].source;
+        catalogs[index].source;
 
 
       for (
@@ -499,6 +569,8 @@ async function getProviderEvents() {
 
     providerId:
       String(meta.id),
+
+    ...(source === "es" ? { providerType: meta.type || catalogs[index].type } : {}),
 
     name: meta.name || meta.title || "",
 
@@ -747,7 +819,9 @@ async function getCatalogEvents() {
         event.source,
 
       id:
-        event.providerId
+        event.providerId,
+
+      ...(event.providerType ? { type: event.providerType } : {})
     });
   }
 
@@ -1099,16 +1173,20 @@ async function getStreams(provider) {
     url = `${STREMVERSE}/stream/tv/${encodeURIComponent(provider.id)}.json`;
   } else if (provider.source === "hf") {
     url = `${HIGHFLY}/stream/sport/${encodeURIComponent(provider.id)}.json`;
+  } else if (provider.source === "es") {
+    const base = easySportsBase();
+    if (!base || !provider.type) return [];
+    url = `${base}/stream/${encodeURIComponent(provider.type)}/${encodeURIComponent(provider.id)}.json`;
   } else {
     return [];
   }
 
-  const data = await getJson(url);
+  const data = provider.source === "es" ? await getJsonRaw(url, 6000) : await getJson(url);
+  const names = { sv: "StremVerse", hf: "Highfly", es: "EasySports" };
 
   return (data.streams || []).map(stream => ({
     ...stream,
-    name: (provider.source === "sv" ? "StremVerse" : "Highfly") +
-      " • " + (stream.name || "Stream")
+    name: names[provider.source] + " • " + (stream.name || "Stream")
   }));
 }
 
@@ -1125,7 +1203,8 @@ const streamCache = new Map();
 const streamInFlight = new Map();
 const streamTimings = {
   sv: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 },
-  hf: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 }
+  hf: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 },
+  es: { requests: 0, failures: 0, empty: 0, totalMs: 0, lastMs: 0 }
 };
 
 function readCachedStreams(id) {
@@ -1243,6 +1322,7 @@ app.get("/debug/stream-performance", (req, res) => {
     note: "Metrics measure stream-link fetching, not playback start or buffering.",
     streamCacheSeconds: STREAM_CACHE_MS / 1000,
     cachedEvents: streamCache.size,
+    easySportsConfigured: !!easySportsBase(),
     sources
   });
 });
@@ -1365,7 +1445,7 @@ app.get(
   (req, res) => {
 
     res.send(
-      "Stremio LIVE Football - StremVerse + Highfly 3.0.0"
+      "Stremio LIVE Football - StremVerse + Highfly + optional EasySports"
     );
   }
 );
