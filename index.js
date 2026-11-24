@@ -1909,7 +1909,7 @@ app.post("/admin/password",managementRoute(async(req,res)=>{
 app.get("/admin",(req,res)=>{
  if(!ownerSession(req))return res.type("html").send(adminLoginPage());
  const users=[...accessUsers.values()].map(u=>({id:u.id,name:u.name,owner:u.id==="owner",active:u.active,lastSeen:accessActivity.get(u.id)||null,...(accessStats.get(u.id)||{requests:0,streams:0,lastEvent:null,sources:{sv:0,hf:0,es:0}})}));
- const data={users,started:accessStartedAt,version:"3.5.3",management:managementReady(),pending:renderChangeBusy||renderChangePending};
+ const data={users,started:accessStartedAt,version:"3.5.4",management:managementReady(),pending:renderChangeBusy||renderChangePending};
  const body='<section><h2>Panoramica</h2><div id="summary"></div><small id="since"></small><p>Le statistiche si azzerano al riavvio. Contano richieste e fonti offerte, non le partite effettivamente viste.</p></section><section id="management"><h2>Gestione accessi</h2><p>Ogni modifica richiede un deploy. Conserva il codice appena generato.</p><form id="invite-form"><label for="invite-name">Nome utente</label><input id="invite-name" maxlength="60" required><label for="invite-password">Password amministratore</label><input id="invite-password" type="password" autocomplete="current-password" required><button class="primary">Genera codice invito</button></form><form id="password-form"><h3>Cambia password</h3><label for="current-password">Password attuale</label><input id="current-password" type="password" autocomplete="current-password" required><label for="new-password">Nuova password</label><input id="new-password" type="password" minlength="12" maxlength="256" autocomplete="new-password" required><label for="confirm-password">Conferma nuova password</label><input id="confirm-password" type="password" minlength="12" maxlength="256" autocomplete="new-password" required><button class="primary">Cambia password</button></form></section><section><h2>Utenti autorizzati</h2><div id="users"></div><p id="management-note"></p><p id="invite-code"></p><button id="copy-invite" hidden>Copia codice</button><button onclick="location.reload()">Aggiorna</button></section><p><a href="/configure">Configura addon</a> · <button id="logout">Esci</button></p><p id="status" role="status"></p>';
  const js=accessClient+'const data='+JSON.stringify(data).replace(/</g,"\\u003c")+';'+String.raw`
 const fmt=t=>t?new Date(t).toLocaleString("it-IT",{timeZone:"Europe/Rome"}):"non rilevata";
@@ -2017,7 +2017,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.5.3",
+    "3.5.4",
 
   name:
     "Dado Live TV",
@@ -2127,11 +2127,12 @@ app.get("/c/:settings/manifest.json",(req,res)=>{
 });
 
 
-function configurePage(config,previousToken="") {
+function configurePage(config,previousToken="",showAdmin=false) {
   const publicConfig={...config,easyProxyPassword:""};
   // Only validated ASCII preference values are inserted into the script.
   return '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dado Live TV | Configurazione</title><style>'+
-  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}a.action[aria-disabled="true"]{opacity:.4;cursor:default}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.5.3</p></div></header>'+
+  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}a.action[aria-disabled="true"]{opacity:.4;cursor:default}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.5.4</p></div></header>'+
+  (showAdmin?'<a class="action" href="/admin" style="margin-bottom:16px;padding:12px">🔐 Pannello amministratore</a>':'')+
   '<section><h2>Cataloghi nella Home</h2><div id="catalogs"></div></section>'+
   '<section><h2>EasyProxy · solo EasySports</h2><p>StremVerse e Highfly restano invariati. Inserisci un URL valido per abilitare EasySports.</p><label for="easyurl">URL EasyProxy</label><input class="field" id="easyurl" type="url" placeholder="http://IP:7860" autocomplete="off"><label for="easypass">Password API (facoltativa)</label><input class="field" id="easypass" type="password" autocomplete="new-password"><p id="proxystate"></p></section>'+
   '<section><h2>Fonti e priorità</h2><p>Attiva le fonti da visualizzare e ordinale a parità di lingua.</p><div id="sources"></div></section>'+
@@ -2148,7 +2149,7 @@ function configurePage(config,previousToken="") {
 }
 app.get(["/configure","/c/:settings/configure"],(req,res)=>{
   const config=req.params.settings?requestSettings(req,res):safeSettings();if(!config)return;
-  res.set("Cache-Control","no-store");res.set("Referrer-Policy","no-referrer");res.type("html").send(configurePage(config,req.params.settings||""));
+  res.set("Cache-Control","no-store");res.set("Referrer-Policy","no-referrer");res.type("html").send(configurePage(config,req.params.settings||"",req.accessUid==="owner"||ownerSession(req)));
 });
 
 app.post("/configure/save",async(req,res)=>{
