@@ -573,6 +573,133 @@ function preferArtwork(target, candidate) {
   }
 }
 
+// Match dates are evaluated in Italy, not in the server's local time zone.
+const MATCH_ZONE = "Europe/Rome";
+const MAX_MATCH_MS = 4 * 60 * 60 * 1000;
+const matchDateFormat = new Intl.DateTimeFormat("en-CA", {
+  timeZone: MATCH_ZONE, year:"numeric", month:"2-digit", day:"2-digit",
+  hour:"2-digit", minute:"2-digit", second:"2-digit", hourCycle:"h23"
+});
+function romeParts(ms) {
+  return Object.fromEntries(matchDateFormat.formatToParts(ms)
+    .filter(p => p.type !== "literal").map(p => [p.type, Number(p.value)]));
+}
+function dayKey(ms) {
+  const p = romeParts(ms);
+  return p.year * 10000 + p.month * 100 + p.day;
+}
+function romeWallTime(y,m,d,h=0,min=0,sec=0) {
+  const wall = Date.UTC(y,m-1,d,h,min,sec);
+  const check = new Date(wall);
+  if (check.getUTCFullYear() !== y || check.getUTCMonth()+1 !== m ||
+      check.getUTCDate() !== d || check.getUTCHours() !== h ||
+      check.getUTCMinutes() !== min || check.getUTCSeconds() !== sec) return null;
+  let result = wall;
+  for (let i=0;i<3;i++) {
+    const p = romeParts(result);
+    const local = Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute,p.second);
+    result += wall-local;
+  }
+  const p = romeParts(result);
+  if (p.year!==y || p.month!==m || p.day!==d || p.hour!==h || p.minute!==min) return null;
+  return result;
+}
+const MONTH_NAMES = {
+  jan:1,january:1,gen:1,gennaio:1,feb:2,february:2,febbraio:2,
+  mar:3,march:3,marzo:3,apr:4,april:4,aprile:4,may:5,mag:5,maggio:5,
+  jun:6,june:6,giu:6,giugno:6,jul:7,july:7,lug:7,luglio:7,
+  aug:8,august:8,ago:8,agosto:8,sep:9,sept:9,september:9,set:9,settembre:9,
+  oct:10,october:10,ott:10,ottobre:10,nov:11,november:11,novembre:11,
+  dec:12,december:12,dic:12,dicembre:12
+};
+function nearestRomeYear(m,d,now) {
+  const y=romeParts(now).year;
+  return [y-1,y,y+1].filter(year=>romeWallTime(year,m,d)!==null)
+    .sort((a,b)=>Math.abs(romeWallTime(a,m,d)-now)-Math.abs(romeWallTime(b,m,d)-now))[0];
+}
+function parseMatchDate(value,now=Date.now()) {
+  if (value===null || value===undefined || value==="") return null;
+  if (typeof value==="number" || (typeof value==="string" && /^\d{10}(?:\d{3})?$/.test(value.trim()))) {
+    const n=Number(value), ms=n<1e12?n*1000:n;
+    return Number.isFinite(ms) && ms>=Date.UTC(2000,0,1) && ms<Date.UTC(2100,0,1)
+      ? {ms,precise:true} : null;
+  }
+  if (typeof value!=="string") return null;
+  const t=value.trim();
+  let match=t.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/i);
+  if (match) {
+    const [,y,m,d,h,min,sec,offset]=match;
+    const ms=offset?Date.parse(t.replace(" ","T")):romeWallTime(+y,+m,+d,+(h||0),+(min||0),+(sec||0));
+    return ms!==null && Number.isFinite(ms)?{ms,precise:!!h}:null;
+  }
+  // Date-only labels such as 16/11, 16 November or November 16.
+  match=t.match(/(?:^|\s)(\d{1,2})[\/.](\d{1,2})(?:[\/.](\d{4}|\d{2}))?(?:[ ,T]+(\d{1,2}):(\d{2}))?(?=$|\s|[,.)])/);
+  let y,m,d,h,min;
+  if (match) {
+    d=+match[1];m=+match[2];y=match[3]?+match[3]:nearestRomeYear(m,d,now);
+    if(y<100)y+=2000;h=match[4];min=match[5];
+  } else {
+    const word=t.toLowerCase().match(/\b(\d{1,2})\s+([a-z]+)\.?(?:[ ,]+(\d{4}))?(?:[ ,]+(\d{1,2}):(\d{2}))?\b/);
+    const reverse=t.toLowerCase().match(/\b([a-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:[ ,]+(\d{4}))?(?:[ ,]+(\d{1,2}):(\d{2}))?\b/);
+    const w=word && MONTH_NAMES[word[2]]?word:reverse && MONTH_NAMES[reverse[1]]?reverse:null;
+    if(!w)return null;
+    d=+(w===word?w[1]:w[2]);m=MONTH_NAMES[w===word?w[2]:w[1]];
+    y=w[3]?+w[3]:nearestRomeYear(m,d,now);h=w[4];min=w[5];
+  }
+  if(!y || y<2000 || y>=2100)return null;
+  const ms=romeWallTime(y,m,d,+(h||0),+(min||0));
+  return ms===null?null:{ms,precise:h!==undefined};
+}
+function matchTiming(meta,source,now=Date.now()) {
+  const statuses=[meta.status,meta.eventStatus,meta.matchStatus,meta.state,
+    meta.status?.type,meta.status?.name,meta.status?.short,meta.status?.description,
+    meta.status?.type?.name,meta.status?.type?.state]
+    .filter(v=>typeof v==="string").map(v=>v.trim().toLowerCase().replace(/[_-]+/g," "));
+  const finished=meta.finished===true || meta.isFinished===true || meta.ended===true ||
+    statuses.some(v=>/^(?:ft|aet|pen|final|finished|ended|completed|complete|post|full time|match ended|cancelled|canceled|abandoned|postponed|terminata|terminato|rinviata|annullata)$/.test(v));
+  const live=meta.isLive===true || statuses.some(v=>/^(?:live|in play|in progress|in|playing|1h|2h|ht|halftime|half time|et|in diretta)$/.test(v));
+  let decodedStart=null;
+  if(source==="es" && typeof meta.id==="string" && meta.id.startsWith("soccer:")){
+    try{decodedStart=JSON.parse(Buffer.from(meta.id.slice(7),"base64url").toString("utf8")).s;}catch{}
+  }
+  const startFields=[["es.id.s",decodedStart],["startTime",meta.startTime],["startDate",meta.startDate],
+    ["startsAt",meta.startsAt],["startTimestamp",meta.startTimestamp],["kickoff",meta.kickoff],
+    ["kickoffTime",meta.kickoffTime],["timestamp",meta.timestamp],["scheduledAt",meta.scheduledAt],
+    ["eventDate",meta.eventDate],["date",meta.date],["released",meta.released],["releaseInfo",meta.releaseInfo]];
+  let selected=null;
+  for(const [field,value] of startFields){
+    const parsed=parseMatchDate(value,now);
+    if(parsed && (!selected || (!selected.precise && parsed.precise && dayKey(parsed.ms)===dayKey(selected.ms)))){
+      selected={...parsed,field};
+      if(parsed.precise)break;
+    }
+  }
+  if(!selected){
+    // Only look at textual dates when structured fields are absent.
+    for(const [field,value] of [["name",meta.name],["description",meta.description]]){
+      const parsed=parseMatchDate(value,now);
+      if(parsed){selected={...parsed,field};break;}
+    }
+  }
+  return {start: selected?.ms ?? null, precise: selected?.precise || false,
+    field: selected?.field || null, finished, live};
+}
+function timeDecision(t,now=Date.now()) {
+  if(!t)return "unknown";
+  if(t.finished)return "finished";
+  if(t.start!==null){
+    if(t.precise){
+      if(now>=t.start+MAX_MATCH_MS)return "expired";
+      return t.start>now?"upcoming":"current";
+    }
+    return dayKey(t.start)<dayKey(now)?"past-day":dayKey(t.start)>dayKey(now)?"upcoming":"today";
+  }
+  return t.live?"live-undated":"unknown";
+}
+function timeVisible(t,now=Date.now()) {
+  return !["unknown","finished","expired","past-day"].includes(timeDecision(t,now));
+}
+
 async function getProviderEvents() {
 
   // Start the existing providers immediately, even while discovering EasySports.
@@ -644,6 +771,8 @@ async function getProviderEvents() {
   if (alreadyExists) {
     preferArtwork(alreadyExists, pickArtwork(meta, source));
     if (!alreadyExists.competition) alreadyExists.competition = competitionLabel(meta);
+    const timing = matchTiming(meta, source);
+    if (timing.finished || (!alreadyExists.timing.finished && (alreadyExists.timing.start === null || (!alreadyExists.timing.precise && timing.precise)))) alreadyExists.timing = timing;
     continue;
   }
 
@@ -659,6 +788,7 @@ async function getProviderEvents() {
 
     name: meta.name || meta.title || "",
     competition: competitionLabel(meta),
+    timing: matchTiming(meta, source),
 
     ...pickArtwork(meta, source),
 
@@ -684,7 +814,7 @@ async function getProviderEvents() {
 ========================================================= */
 
 function wantedProviderEvent(event) {
-  return !!event?.name && wantedEvent(event.name);
+  return !!event?.name && wantedEvent(event.name) && timeVisible(event.timing);
 }
 
 function isSecondTeamMatch(value = "") {
@@ -866,6 +996,7 @@ async function getCatalogEvents() {
         posterShape: event.posterShape,
         posterRank: event.posterRank,
         competition: event.competition,
+        timings: [],
 
         description:
           event.description,
@@ -884,6 +1015,7 @@ async function getCatalogEvents() {
 
     preferArtwork(item, event);
     if (!item.competition && event.competition) item.competition = event.competition;
+    item.timings.push(event.timing);
 
 
     item.providers.push({
@@ -923,11 +1055,16 @@ const CACHE_MS = 5 * 60 * 1000;
 const STALE_MS = 20 * 60 * 1000;
 const RETRY_MS = 30 * 1000;
 
+function currentCatalog(events) {
+  const now = Date.now();
+  return events.filter(event => event.timings.some(timing => timeVisible(timing, now)));
+}
+
 async function getCachedCatalog() {
   const now = Date.now();
 
   if (catalogCache.initialized && catalogCache.expires > now) {
-    return catalogCache.events;
+    return currentCatalog(catalogCache.events);
   }
 
   // Share provider requests between concurrent Stremio catalog requests.
@@ -962,10 +1099,10 @@ async function getCachedCatalog() {
   // Never keep older live events past the bounded stale cache interval.
   if (catalogCache.initialized && catalogCache.staleUntil > now) {
     catalogRefreshPromise.catch(() => {});
-    return catalogCache.events;
+    return currentCatalog(catalogCache.events);
   }
 
-  return catalogRefreshPromise;
+  return currentCatalog(await catalogRefreshPromise);
 }
 
 
@@ -1707,6 +1844,21 @@ app.get(
     }
   }
 );
+
+// Inspect date interpretation without exposing upstream URLs or access tokens.
+app.get("/debug/time-filter", async (req, res) => {
+  res.set("Cache-Control","no-store");
+  try {
+    const now=Date.now(), all=await getProviderEvents();
+    const events=all.filter(event=>event.name && wantedEvent(event.name)).map(event=>({
+      name:event.name,source:event.source,
+      start:event.timing.start===null?null:new Date(event.timing.start).toISOString(),
+      precise:event.timing.precise,field:event.timing.field,
+      decision:timeDecision(event.timing,now),visible:timeVisible(event.timing,now)
+    }));
+    res.json({now:new Date(now).toISOString(),timezone:MATCH_ZONE,events});
+  }catch{res.status(502).json({error:"Provider catalogs unavailable"});}
+});
 
 /* =========================================================
    DEBUG FILTRO
