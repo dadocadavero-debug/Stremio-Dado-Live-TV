@@ -1,4 +1,13 @@
 const express = require("express");
+const sharp = require("sharp");
+const crypto = require("crypto");
+const http = require("http");
+const https = require("https");
+const { Resolver } = require("dns").promises;
+const { isIP } = require("net");
+
+sharp.concurrency(1);
+sharp.cache({ memory: 16, files: 0, items: 32 });
 
 const app = express();
 app.use(express.json());
@@ -973,6 +982,182 @@ function decodeEventId(id) {
    META CATALOGO
 ========================================================= */
 
+// Stremio Discover uses a uniform portrait grid even for landscape metadata.
+// Serve a real portrait JPEG with the complete fallback artwork centered inside.
+const ARTWORK_ORIGIN = "https://dado-live-tv.onrender.com";
+const artworkRefs = new Map();
+const artworkCache = new Map();
+const artworkInFlight = new Map();
+const artworkQueue = [];
+let artworkActive = 0;
+const ARTWORK_BYTES_MAX = 5 * 1024 * 1024;
+
+function rememberBounded(map, key, value, max) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > max) map.delete(map.keys().next().value);
+}
+
+function artworkId(event) {
+  return crypto.createHash("sha256").update(event.key + "\n" + event.poster)
+    .digest("hex");
+}
+
+function artworkForMeta(event) {
+  if (!event.poster) return undefined;
+  // Preserve original StremVerse portrait artwork; adapt all fallback artwork.
+  if (event.posterRank === 0 && event.posterShape === "poster") return event.poster;
+  const id = artworkId(event);
+  rememberBounded(artworkRefs, id, event.poster, 1000);
+  return ARTWORK_ORIGIN + "/artwork/v1/" + id + ".jpg";
+}
+
+function publicArtworkIP(ip) {
+  if (isIP(ip) !== 4) return false;
+  const [a,b,c] = ip.split(".").map(Number);
+  return !(a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 168 || b === 0 ||
+      (b === 88 && c === 99))) || (a === 198 && (b === 18 || b === 19 ||
+      (b === 51 && c === 100))) || (a === 203 && b === 0 && c === 113));
+}
+
+// The route only accepts opaque IDs registered by the catalog, not user URLs.
+// Still validate each redirect and pin DNS to a public IPv4 address.
+async function downloadArtwork(value, redirects = 0) {
+  if (redirects > 3) throw new Error("Too many redirects");
+  const url = new URL(value);
+  if (!["https:", "http:"].includes(url.protocol) || url.username || url.password ||
+      (url.port && url.port !== (url.protocol === "https:" ? "443" : "80"))) {
+    throw new Error("Unsupported artwork URL");
+  }
+  const resolver = new Resolver({ timeout: 2000, tries: 1 });
+  const addresses = isIP(url.hostname) ? [url.hostname] : await resolver.resolve4(url.hostname);
+  if (!addresses.length || addresses.some(ip => !publicArtworkIP(ip))) {
+    throw new Error("Unsafe artwork address");
+  }
+  const address = addresses[0];
+  const result = await new Promise((resolve, reject) => {
+    const transport = url.protocol === "https:" ? https : http;
+    let timer;
+    const request = transport.get(url, {
+      agent: false,
+      family: 4,
+      autoSelectFamily: false,
+      lookup: (_name, opts, callback) => {
+        if (opts.all) callback(null, [{ address, family: 4 }]);
+        else callback(null, address, 4);
+      },
+      headers: { "User-Agent": "Stremio-LIVE/3.0", Accept: "image/*" }
+    }, response => {
+      const status = response.statusCode || 0;
+      if ([301,302,303,307,308].includes(status) && response.headers.location) {
+        resolve({ redirect: new URL(response.headers.location, url).href });
+        response.destroy();
+        return;
+      }
+      if (status !== 200 || Number(response.headers["content-length"] || 0) > ARTWORK_BYTES_MAX) {
+        response.destroy();
+        reject(new Error("Artwork unavailable"));
+        return;
+      }
+      const type = String(response.headers["content-type"] || "").toLowerCase();
+      if (type && !type.startsWith("image/") && !type.startsWith("application/octet-stream")) {
+        response.destroy();
+        reject(new Error("Not an image"));
+        return;
+      }
+      let size = 0;
+      const chunks = [];
+      response.on("data", chunk => {
+        size += chunk.length;
+        if (size > ARTWORK_BYTES_MAX) {
+          request.destroy(new Error("Artwork too large"));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("error", reject);
+      response.on("end", () => resolve({ buffer: Buffer.concat(chunks) }));
+    });
+    timer = setTimeout(() => request.destroy(new Error("Artwork timeout")), 7000);
+    request.on("error", reject);
+    request.on("close", () => clearTimeout(timer));
+  });
+  return result.redirect ? downloadArtwork(result.redirect, redirects + 1) : result.buffer;
+}
+
+function drainArtworkQueue() {
+  while (artworkActive < 3 && artworkQueue.length) {
+    const { task, resolve, reject } = artworkQueue.shift();
+    artworkActive++;
+    Promise.resolve().then(task).then(resolve, reject).finally(() => {
+      artworkActive--;
+      drainArtworkQueue();
+    });
+  }
+}
+
+function scheduleArtwork(task) {
+  return new Promise((resolve, reject) => {
+    if (artworkQueue.length >= 96) return reject(new Error("Artwork queue full"));
+    artworkQueue.push({ task, resolve, reject });
+    drainArtworkQueue();
+  });
+}
+
+async function renderPortrait(id, source) {
+  const cached = artworkCache.get(id);
+  if (cached && cached.expires > Date.now()) {
+    rememberBounded(artworkCache, id, cached, 96);
+    return cached.buffer;
+  }
+  if (artworkInFlight.has(id)) return artworkInFlight.get(id);
+  const work = scheduleArtwork(async () => {
+    const input = await downloadArtwork(source);
+    const buffer = await sharp(input, { limitInputPixels: 16000000 })
+      .rotate()
+      .resize(480, 720, {
+        fit: "contain",
+        position: "centre",
+        background: { r: 22, g: 25, b: 32, alpha: 1 }
+      })
+      .flatten({ background: "#161920" })
+      .jpeg({ quality: 86 })
+      .toBuffer();
+    rememberBounded(artworkCache, id, { buffer, expires: Date.now() + 30 * 60 * 1000 }, 96);
+    return buffer;
+  }).finally(() => artworkInFlight.delete(id));
+  artworkInFlight.set(id, work);
+  return work;
+}
+
+app.get("/artwork/v1/:id.jpg", async (req, res) => {
+  const id = req.params.id;
+  if (!/^[a-f0-9]{64}$/.test(id)) return res.sendStatus(404);
+  try {
+    let source = artworkRefs.get(id);
+    if (!source) {
+      // A cached client may request an image after a Render restart.
+      const events = await getCachedCatalog();
+      const event = events.find(item => item.poster &&
+        !(item.posterRank === 0 && item.posterShape === "poster") && artworkId(item) === id);
+      if (event) {
+        artworkForMeta(event);
+        source = event.poster;
+      }
+    }
+    if (!source) return res.sendStatus(404);
+    const buffer = await renderPortrait(id, source);
+    res.set("Cache-Control", "public, max-age=600");
+    return res.type("jpeg").send(buffer);
+  } catch {
+    // Never expose upstream URLs or credentials through errors or logs.
+    res.set("Cache-Control", "no-store");
+    return res.sendStatus(502);
+  }
+});
+
 function eventToMeta(event) {
 
   return {
@@ -988,11 +1173,9 @@ function eventToMeta(event) {
     name:
       event.name,
 
-    poster:
-      event.poster ||
-      undefined,
+    poster: artworkForMeta(event),
 
-    posterShape: event.posterShape || "poster",
+    posterShape: "poster",
 
     description:
       event.description ||
