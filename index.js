@@ -1899,7 +1899,7 @@ function labelStream(stream,source){
   const channel=displayChannel(stream);
   const proxy=isProxyStream(stream);
   const label=lang.label.replace(/\s+(?:IT|EN)$/,"");
-  const name=[label,proxy?"[PROXY]":"",channel].filter(Boolean).join(" ")+" • "+(names[source]||source);
+  const name=[label,names[source]||source,proxy?"[PROXY]":""].filter(Boolean).join(" • ")+" • "+channel;
   return {stream:{...stream,name},rank:lang.rank,sourceRank:STREAM_SOURCE_RANK[source]??99};
 }
 function sortStreamEntries(entries){
