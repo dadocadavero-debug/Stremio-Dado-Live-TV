@@ -1899,10 +1899,8 @@ function labelStream(stream,source){
   const channel=displayChannel(stream);
   const proxy=isProxyStream(stream);
   const label=lang.label.replace(/\s+(?:IT|EN)$/,"");
-  // Stremio renders name as the header and title/description as the detail.
-  const name=names[source]||source;
-  const detail=[label,channel,proxy?"[PROXY]":""].filter(Boolean).join(" • ");
-  return {stream:{...stream,name,title:detail,description:detail},rank:lang.rank,sourceRank:STREAM_SOURCE_RANK[source]??99};
+  const name=[label,names[source]||source,proxy?"[PROXY]":""].filter(Boolean).join(" • ")+" • "+channel;
+  return {stream:{...stream,name},rank:lang.rank,sourceRank:STREAM_SOURCE_RANK[source]??99};
 }
 function sortStreamEntries(entries){
   return entries.slice().sort((a,b)=>a.rank-b.rank||a.sourceRank-b.sourceRank);
