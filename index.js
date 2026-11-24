@@ -669,8 +669,8 @@ function matchTiming(meta,source,now=Date.now()) {
     statuses.some(v=>/^(?:ft|aet|pen|final|finished|ended|completed|complete|post|full time|match ended|cancelled|canceled|abandoned|postponed|terminata|terminato|rinviata|annullata)$/.test(v));
   const live=meta.isLive===true || statuses.some(v=>/^(?:live|in play|in progress|in|playing|1h|2h|ht|halftime|half time|et|in diretta)$/.test(v));
   let decodedStart=null;
-  if(source==="es" && typeof meta.id==="string" && meta.id.startsWith("soccer:")){
-    try{decodedStart=JSON.parse(Buffer.from(meta.id.slice(7),"base64url").toString("utf8")).s;}catch{}
+  if(source==="es" && typeof meta.id==="string" && /^[a-z][a-z0-9_-]*:/i.test(meta.id)){
+    try{decodedStart=JSON.parse(Buffer.from(meta.id.slice(meta.id.indexOf(":")+1),"base64url").toString("utf8")).s;}catch{}
   }
   const startFields=[["es.id.s",decodedStart],["startTime",meta.startTime],["startDate",meta.startDate],
     ["startsAt",meta.startsAt],["startTimestamp",meta.startTimestamp],["kickoff",meta.kickoff],
@@ -699,7 +699,7 @@ function timeDecision(t,now=Date.now()) {
   if(t.finished)return "finished";
   if(t.start!==null){
     if(t.precise){
-      if(now>=t.start+MAX_MATCH_MS)return "expired";
+      if(now>=t.start+(t.sport==="tennis"?8*60*60*1000:t.sport==="motors"?12*60*60*1000:MAX_MATCH_MS))return "expired";
       return t.start>now?"upcoming":"current";
     }
     return dayKey(t.start)<dayKey(now)?"past-day":dayKey(t.start)>dayKey(now)?"upcoming":"today";
@@ -753,12 +753,77 @@ async function collectCatalogResponses(existing, discover, fetchCatalog) {
   return {catalogs:[...existing,...b.catalogs],results:[...a,...b.results]};
 }
 
-async function getProviderEvents() {
+function sportCategory(value) {
+  const t=sportText(value);
+  if(/\b(?:table tennis|ping pong|padel|badminton|esports|virtual tennis)\b/.test(t))return "";
+  if(/\b(?:tennis|atp|wta|itf|challenger tour|davis cup|billie jean king cup|wimbledon|roland garros|australian open|us open tennis)\b/.test(t))return "tennis";
+  if(/\b(?:motorsport|motor sports?|motorsports|motor racing|formula [123e]|f1|f2|f3|motogp|moto gp|moto[23]|superbike|wsbk|nascar|indycar|indy car|wrc|rally|world endurance|wec|imsa|motocross|supercross|dtm|supercars|motorcycle racing)\b/.test(t))return "motors";
+  if(isFootballSport(value))return "football";
+  return "";
+}
+function classifySportMeta(meta,catalog) {
+  const values=[meta.sport,meta.sportName,meta.genre,meta.genres,meta.category,meta.categories,meta.league,meta.competition,String(meta.id||"").split(":")[0],meta.name,meta.title];
+  const strong=sportText(values);
+  if(/\b(?:table tennis|ping pong|padel|badminton|esports|virtual tennis)\b/.test(strong))return "";
+  const direct=values.map(sportCategory).filter(Boolean);
+  if(direct.includes("tennis"))return "tennis";
+  if(direct.includes("motors"))return "motors";
+  if(direct.includes("football"))return "football";
+  if(isOtherSport(strong))return "";
+  return catalog.sport||sportCategory(meta.description);
+}
+function sportCatalogOptions(manifest,base,source,sport) {
+  const options=[];
+  for(const catalog of manifest?.catalogs||[]){
+    if(!catalog?.id||!catalog.type)continue;
+    const extras=Array.isArray(catalog.extra)?catalog.extra:[];
+    const genre=extras.find(x=>x.name==="genre");
+    const required=[...extras.filter(x=>x.isRequired).map(x=>x.name),...(catalog.extraRequired||[])];
+    if(required.some(x=>x!=="genre"))continue;
+    const label=[catalog.id,catalog.name,catalog.type],own=sportCategory(label);
+    const matches=(Array.isArray(genre?.options)?genre.options:[]).filter(x=>sportCategory(x)===sport);
+    const root=base+"/catalog/"+encodeURIComponent(catalog.type)+"/"+encodeURIComponent(catalog.id);
+    for(const option of matches)options.push({source,type:catalog.type,sport,url:root+"/genre="+encodeURIComponent(option)+".json"});
+    if(!matches.length&&!required.includes("genre")&&own===sport)options.push({source,type:catalog.type,sport,url:root+".json"});
+    if(!matches.length&&!required.includes("genre")&&!own&&!isOtherSport(label)&&/\b(?:live|today|sport|sports|events|upcoming)\b/.test(sportText(label)))
+      options.push({source,type:catalog.type,sport:null,url:root+".json"});
+  }
+  const dedicated=options.filter(x=>x.sport===sport);
+  return [...new Map((dedicated.length?dedicated:options).map(x=>[x.url,x])).values()].slice(0,12);
+}
+const extraManifestCache=new Map(),extraManifestPending=new Map();
+async function sportManifest(source,base) {
+  const cached=extraManifestCache.get(source);
+  if(cached&&cached.expires>Date.now())return cached.value;
+  if(extraManifestPending.has(source))return extraManifestPending.get(source);
+  const work=getJsonRaw(base+"/manifest.json",5000).then(value=>{
+    extraManifestCache.set(source,{value,expires:Date.now()+30*60*1000});return value;
+  }).catch(()=>cached?.value||null).finally(()=>extraManifestPending.delete(source));
+  extraManifestPending.set(source,work);return work;
+}
+async function discoverSportCatalogs(sport) {
+  const inputs=[["sv",STREMVERSE],["hf",HIGHFLY],["es",easySportsBase()]].filter(x=>x[1]);
+  const groups=await Promise.all(inputs.map(async ([source,base])=>sportCatalogOptions(await sportManifest(source,base),base,source,sport)));
+  return groups.flat();
+}
+function sportEventKey(event) {
+  if(event.sport==="football")return eventKey(event.name);
+  const sides=getMatchSides(event.name);
+  const title=sides.length===2?sides.map(sportText).sort().join("|"):sportText(event.name);
+  const day=Number.isFinite(event.timing?.start)?dayKey(event.timing.start):"undated";
+  // Include competition and kickoff for new sports to avoid collapsing different matches or sessions.
+  const kickoff=event.timing?.precise?Math.floor(event.timing.start/60000):"";
+  return title?event.sport+":"+day+":"+sportText(event.competition)+":"+kickoff+":"+title:"";
+}
+
+async function getProviderEvents(sport = "football") {
 
   const started=Date.now();
   // EasySports catalog requests begin as soon as discovery finishes, not after
   // StremVerse and Highfly have returned. Keep deterministic source order.
-  const {catalogs,results}=await collectCatalogResponses(PROVIDER_CATALOGS,getEasySportsCatalogs,providerCatalog);
+  const existing=sport==="football"?PROVIDER_CATALOGS:PROVIDER_CATALOGS.filter(item=>item.source==="hf"&&/sports_(?:live|today)\.json$/.test(item.url));
+  const discover=sport==="football"?getEasySportsCatalogs:()=>discoverSportCatalogs(sport);
+  const {catalogs,results}=await collectCatalogResponses(existing,discover,providerCatalog);
   catalogPerformance.refreshes++;
   catalogPerformance.lastRefreshMs=Date.now()-started;
 
@@ -802,9 +867,9 @@ async function getProviderEvents() {
   if (!meta?.id) {
     continue;
   }
-  if (source === "es" && !easySportsFootballMeta(meta, catalogs[index])) {
-    continue;
-  }
+  if(sport==="football"){
+    if(source==="es"&&!easySportsFootballMeta(meta,catalogs[index]))continue;
+  }else if(classifySportMeta(meta,catalogs[index])!==sport)continue;
 
 
   const providerKey =
@@ -817,7 +882,7 @@ async function getProviderEvents() {
   if (alreadyExists) {
     preferArtwork(alreadyExists, pickArtwork(meta, source));
     if (!alreadyExists.competition) alreadyExists.competition = competitionLabel(meta);
-    const timing = matchTiming(meta, source);
+    const timing = {...matchTiming(meta, source), sport};
     if (timing.finished || (!alreadyExists.timing.finished && (alreadyExists.timing.start === null || (!alreadyExists.timing.precise && timing.precise)))) alreadyExists.timing = timing;
     continue;
   }
@@ -826,15 +891,16 @@ async function getProviderEvents() {
   const event={
 
     source,
+    sport,
 
     providerId:
       String(meta.id),
 
-    ...(source === "es" ? { providerType: meta.type || catalogs[index].type } : {}),
+    ...(source === "es" || sport !== "football" ? { providerType: sport==="football"?(meta.type||catalogs[index].type):(catalogs[index].type || meta.type || (source==="sv"?"tv":"sport")) } : {}),
 
     name: meta.name || meta.title || "",
-    competition: competitionLabel(meta),
-    timing: matchTiming(meta, source),
+    competition: competitionLabel(meta) || (sport!=="football" && String(meta.name||meta.title||"").includes(":") ? String(meta.name||meta.title).split(":")[0].trim() : ""),
+    timing: {...matchTiming(meta, source), sport},
 
     ...pickArtwork(meta, source),
 
@@ -863,7 +929,7 @@ async function getProviderEvents() {
 ========================================================= */
 
 function wantedProviderEvent(event) {
-  return !!event?.name && wantedEvent(event.name) && timeVisible(event.timing);
+  return !!event?.name && (event.sport==='tennis'||event.sport==='motors'||wantedEvent(event.name)) && timeVisible(event.timing);
 }
 
 function isSecondTeamMatch(value = "") {
@@ -1003,10 +1069,10 @@ function eventKey(name = "") {
 }
 
 
-async function getCatalogEvents() {
+async function getCatalogEvents(sport = 'football') {
 
   const all =
-    await getProviderEvents();
+    await getProviderEvents(sport);
 
 
   const filtered =
@@ -1024,7 +1090,7 @@ async function getCatalogEvents() {
   for (const event of filtered) {
 
     const key =
-      eventKey(event.name);
+      sportEventKey(event);
 
 
     if (!key) {
@@ -1037,6 +1103,7 @@ async function getCatalogEvents() {
       map.set(key, {
 
         key,
+        sport,
 
         name:
           event.name,
@@ -1104,6 +1171,20 @@ const CACHE_MS = 5 * 60 * 1000;
 const STALE_MS = 20 * 60 * 1000;
 const RETRY_MS = 30 * 1000;
 
+const sportCaches=new Map(),sportRefreshes=new Map();
+async function getSportCatalog(sport) {
+  if(sport==="football")return getCachedCatalog();
+  const now=Date.now(), cached=sportCaches.get(sport);
+  if(cached&&cached.expires>now)return currentCatalog(cached.events);
+  if(!sportRefreshes.has(sport)){
+    const work=getCatalogEvents(sport).then(events=>{
+      sportCaches.set(sport,{events,expires:Date.now()+CACHE_MS,staleUntil:Date.now()+STALE_MS});return events;
+    }).finally(()=>sportRefreshes.delete(sport));
+    sportRefreshes.set(sport,work);
+  }
+  if(cached&&cached.staleUntil>now){sportRefreshes.get(sport).catch(()=>{});return currentCatalog(cached.events);}
+  return currentCatalog(await sportRefreshes.get(sport));
+}
 function currentCatalog(events) {
   const now = Date.now();
   return events.filter(event => event.timings.some(timing => timeVisible(timing, now)));
@@ -1223,7 +1304,7 @@ function artworkId(event, version = "v6") {
 
 function artworkReference(event) {
   return { url: event.poster, name: event.name || "", competition: event.competition || "",
-    timing: pickDisplayTiming(event) };
+    timing: pickDisplayTiming(event), sport:event.sport||"football" };
 }
 
 function artworkForMeta(event) {
@@ -1463,7 +1544,7 @@ function footerGeometry(topCount, bottomCount) {
 }
 
 function portraitOverlay(source, hasLogo = false, version = "v6") {
-  const competition = posterLines(cleanPosterText(source.competition) || "CALCIO", hasLogo ? 20 : 24, 2);
+  const competition = posterLines(cleanPosterText(source.competition) || (source.sport==="tennis"?"TENNIS":source.sport==="motors"?"MOTORI":"CALCIO"), hasLogo ? 20 : 24, 2);
   const sides = getMatchSides(cleanPosterText(source.name)).map(cleanPosterText).filter(Boolean);
   const dateLabel = formatPosterDateTime(source.timing);
   const textLine = (value,y,fontSize,color,weight=700,x=240,maxWidth=428) => {
@@ -1562,9 +1643,16 @@ app.get(["/artwork/v1/:id.jpg", "/artwork/v2/:id.jpg", "/artwork/v3/:id.jpg", "/
     let source = artworkRefs.get(id);
     if (!source) {
       // A cached client may request an image after a Render restart.
-      const events = await getCachedCatalog();
-      const event = events.find(item => item.poster &&
-        !(item.posterRank === 0 && item.posterShape === "poster") && artworkId(item, version) === id);
+      const matches=item=>item.poster && !(item.posterRank===0&&item.posterShape==="poster")&&artworkId(item,version)===id;
+      let event=[...catalogCache.events,...Array.from(sportCaches.values()).flatMap(c=>c.events)].find(matches);
+      if(!event){
+        const football=await getCachedCatalog().catch(()=>[]);
+        event=football.find(matches);
+      }
+      if(!event){
+        const groups=await Promise.allSettled(["motors","tennis"].map(getSportCatalog));
+        event=groups.flatMap(g=>g.status==="fulfilled"?g.value:[]).find(matches);
+      }
       if (event) {
         source = artworkReference(event);
         rememberBounded(artworkRefs, id, source, 1000);
@@ -1602,7 +1690,7 @@ function eventToMeta(event) {
 
     description:
       event.description ||
-      `⚽ ${event.name}`,
+      `${event.sport==="tennis"?"🎾":event.sport==="motors"?"🏎️":"⚽"} ${event.name}`,
 
     releaseInfo:
       event.releaseInfo ||
@@ -1621,13 +1709,13 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.1.0",
+    "3.2.1",
 
   name:
     "Dado Live TV",
 
   description:
-    "Top Club Europei & Nazionali",
+    "Calcio, Motori e Tennis",
 
   logo:
     "https://dado-live-tv.onrender.com/logo.png",
@@ -1652,7 +1740,8 @@ const manifest = {
 
       name:
         "🔴 LIVE Football ⚽"
-    }
+    },
+    {type:"tv",id:"live_sport_v1",name:"🔴 LIVE Sport"}
   ],
 
   idPrefixes: [
@@ -1726,6 +1815,24 @@ app.get(
    TROVA EVENTO
 ========================================================= */
 
+function combineSportResults(results) {
+  const kickoff=event=>pickDisplayTiming(event)?.start??Infinity;
+  return results.flatMap(r=>r.status==="fulfilled"?r.value:[])
+    .sort((a,b)=>kickoff(a)-kickoff(b)||a.name.localeCompare(b.name,"it"));
+}
+app.get("/catalog/tv/live_sport_v1.json",async(req,res)=>{
+  const results=await Promise.allSettled(["motors","tennis"].map(getSportCatalog));
+  res.json({metas:combineSportResults(results).map(eventToMeta)});
+});
+app.get("/debug/sports",async(req,res)=>{
+  res.set("Cache-Control","no-store");
+  const sports=["football","motors","tennis"];
+  const results=await Promise.allSettled(sports.map(getSportCatalog));
+  res.json(Object.fromEntries(sports.map((sport,i)=>[sport,results[i].status==="fulfilled"?{
+    count:results[i].value.length,events:results[i].value.map(e=>({name:e.name,sources:e.providers.map(p=>p.source)}))
+  }:{error:"Catalog unavailable"}])));
+});
+
 async function findEvent(id) {
 
   if (
@@ -1748,8 +1855,8 @@ async function findEvent(id) {
   }
 
 
-  const events =
-    await getCachedCatalog();
+  const sport=key.startsWith("tennis:")?"tennis":key.startsWith("motors:")?"motors":"football";
+  const events=await getSportCatalog(sport);
 
 
   return (
@@ -1911,9 +2018,9 @@ async function getStreams(provider) {
   let url;
 
   if (provider.source === "sv") {
-    url = `${STREMVERSE}/stream/tv/${encodeURIComponent(provider.id)}.json`;
+    url = `${STREMVERSE}/stream/${encodeURIComponent(provider.type||"tv")}/${encodeURIComponent(provider.id)}.json`;
   } else if (provider.source === "hf") {
-    url = `${HIGHFLY}/stream/sport/${encodeURIComponent(provider.id)}.json`;
+    url = `${HIGHFLY}/stream/${encodeURIComponent(provider.type||"sport")}/${encodeURIComponent(provider.id)}.json`;
   } else if (provider.source === "es") {
     const base = easySportsBase();
     if (!base || !provider.type) return [];
