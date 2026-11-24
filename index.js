@@ -1,6 +1,7 @@
 const express = require("express");
 const sharp = require("sharp");
 const crypto = require("crypto");
+const {AsyncLocalStorage}=require("async_hooks");
 const http = require("http");
 const https = require("https");
 const { Resolver } = require("dns").promises;
@@ -13,7 +14,7 @@ const app = express();
 app.use(express.json());
 app.use((req,res,next)=>{
   res.set("Access-Control-Allow-Origin","*");
-  res.set("Access-Control-Allow-Methods","GET, HEAD, OPTIONS");
+  res.set("Access-Control-Allow-Methods","GET, HEAD, POST, OPTIONS");
   res.set("Access-Control-Allow-Headers","Content-Type");
   if(req.method==="OPTIONS")return res.sendStatus(204);
   next();
@@ -36,10 +37,9 @@ let preferredHighflyBase = HIGHFLY;
 
 // Keep the configured manifest (which may include proxy credentials) out of Git.
 const EASYSPORTS_MANIFEST_URL = process.env.EASYSPORTS_MANIFEST_URL || "";
-let easySportsCatalogCache = { expires: 0, staleUntil: 0, catalogs: [] };
-let easySportsManifestInFlight = null;
+const esCaches=new Map(),esPending=new Map(),scope=new AsyncLocalStorage();
 
-function easySportsBase() {
+function legacyEasySportsBase() {
   if (!EASYSPORTS_MANIFEST_URL) return null;
   try {
     const url = new URL(EASYSPORTS_MANIFEST_URL);
@@ -54,6 +54,39 @@ function easySportsBase() {
 }
 
 
+
+function easySportsBase(){const p=scope.getStore();return p?p.base:legacyEasySportsBase();}
+function profileKey(){return scope.getStore()?.key||"legacy";}
+function proxyURL(v){try{if(typeof v!=="string"||v.length>400)return "";const u=new URL(v.trim());return ["http:","https:"].includes(u.protocol)&&u.hostname&&!u.username&&!u.password&&!u.search&&!u.hash&&u.pathname==="/"?u.origin:"";}catch{return "";}}
+function proxyTemplate(){
+  try{
+    const u=new URL(legacyEasySportsBase()),parts=u.pathname.split("/").filter(Boolean),matches=[];
+    for(let i=0;i<parts.length;i++){
+      try{
+        const cfg=JSON.parse(Buffer.from(decodeURIComponent(parts[i]),"base64url").toString("utf8"));
+        if(!cfg||typeof cfg!=="object"||Array.isArray(cfg))continue;
+        const fields=[];
+        function walk(o,path=[]){for(const [k,v] of Object.entries(o)){const p=[...path,k];if(v&&typeof v==="object"&&!Array.isArray(v))walk(v,p);else fields.push({p,v,k:p.join("").toLowerCase().replace(/[^a-z0-9]/g,"")});}}
+        walk(cfg);
+        const urls=fields.filter(f=>proxyURL(f.v));
+        const pw=fields.filter(f=>typeof f.v==="string"&&/(?:password|passwd|pwd|pass|secret|apikey|apitoken|proxykey|epkey|mfpkey|pkey|^key$|^token$)/.test(f.k));
+        if(urls.length!==1||pw.length>1||fields.some(f=>!urls.includes(f)&&!pw.includes(f)&&f.v&&/(?:auth|credential|token|key|password|secret)/.test(f.k)))continue;
+        matches.push({u,parts,i,cfg,url:urls[0].p,pw:pw[0]?.p});
+      }catch{}
+    }
+    return matches.length===1?matches[0]:null;
+  }catch{return null;}
+}
+function personalBase(url,password){
+  const t=proxyTemplate();if(!t||!proxyURL(url)||(!t.pw&&password))return null;
+  function set(path,value){let o=t.cfg;for(const k of path.slice(0,-1))o=o[k];o[path.at(-1)]=value;}
+  set(t.url,proxyURL(url));if(t.pw)set(t.pw,password||"");
+  t.parts[t.i]=Buffer.from(JSON.stringify(t.cfg)).toString("base64url");
+  return t.u.origin+"/"+t.parts.join("/");
+}
+function encryptionKey(){const k=process.env.DADO_CONFIG_KEY||"";return /^[a-f0-9]{64}$/i.test(k)?Buffer.from(k,"hex"):null;}
+function seal(v){const k=encryptionKey();if(!k)throw Error("Missing key");const iv=crypto.randomBytes(12),c=crypto.createCipheriv("aes-256-gcm",k,iv);const b=Buffer.concat([c.update(JSON.stringify(v)),c.final()]);return Buffer.concat([iv,c.getAuthTag(),b]).toString("base64url");}
+function unseal(v){try{const b=Buffer.from(v,"base64url"),d=crypto.createDecipheriv("aes-256-gcm",encryptionKey(),b.subarray(0,12));d.setAuthTag(b.subarray(12,28));return JSON.parse(Buffer.concat([d.update(b.subarray(28)),d.final()]).toString());}catch{return null;}}
 /* =========================================================
    NORMALIZZAZIONE
 ========================================================= */
@@ -347,7 +380,7 @@ async function getJsonRaw(url, timeoutMs = 12000, parentSignal = null) {
     });
 
     if (!response.ok) {
-      throw new Error(`${response.status} ${url}`);
+      throw new Error(`Upstream HTTP ${response.status}`);
     }
 
     return await response.json();
@@ -496,6 +529,7 @@ function easySportsFootballMeta(meta, catalog) {
 async function discoverEasySportsCatalogs() {
   const base = easySportsBase();
   if (!base) return [];
+  let easySportsCatalogCache=esCaches.get(base)||{expires:0,staleUntil:0,catalogs:[]};
   if (easySportsCatalogCache.expires > Date.now()) {
     return easySportsCatalogCache.catalogs;
   }
@@ -531,21 +565,17 @@ async function discoverEasySportsCatalogs() {
       staleUntil: Date.now() + 6 * 60 * 60 * 1000,
       catalogs: selected
     };
+    rememberBounded(esCaches,base,easySportsCatalogCache,32);
     return selected;
   } catch {
     // Never log the configured manifest URL or its credentials.
     console.warn("EasySports manifest unavailable");
     const previous=easySportsCatalogCache.staleUntil>Date.now()?easySportsCatalogCache.catalogs:[];
     easySportsCatalogCache={...easySportsCatalogCache,expires:Date.now()+30*1000,catalogs:previous};
-    return previous;
+    rememberBounded(esCaches,base,easySportsCatalogCache,32);return previous;
   }
 }
-
-function getEasySportsCatalogs() {
-  if (easySportsManifestInFlight) return easySportsManifestInFlight;
-  easySportsManifestInFlight=discoverEasySportsCatalogs().finally(()=>{easySportsManifestInFlight=null;});
-  return easySportsManifestInFlight;
-}
+function getEasySportsCatalogs(){const base=easySportsBase();if(!base)return Promise.resolve([]);if(esPending.has(base))return esPending.get(base);const work=discoverEasySportsCatalogs().finally(()=>esPending.delete(base));esPending.set(base,work);return work;}
 
 // Prefer real StremVerse posters, then EasySports and Highfly artwork.
 // Preserve the selected image's own shape when merging matching events.
@@ -800,13 +830,14 @@ function sportCatalogOptions(manifest,base,source,sport) {
 }
 const extraManifestCache=new Map(),extraManifestPending=new Map();
 async function sportManifest(source,base) {
-  const cached=extraManifestCache.get(source);
+  const cacheKey=source==="es"?base:source;
+  const cached=extraManifestCache.get(cacheKey);
   if(cached&&cached.expires>Date.now())return cached.value;
-  if(extraManifestPending.has(source))return extraManifestPending.get(source);
+  if(extraManifestPending.has(cacheKey))return extraManifestPending.get(cacheKey);
   const work=getJsonRaw(base+"/manifest.json",5000).then(value=>{
-    extraManifestCache.set(source,{value,expires:Date.now()+30*60*1000});return value;
-  }).catch(()=>cached?.value||null).finally(()=>extraManifestPending.delete(source));
-  extraManifestPending.set(source,work);return work;
+    rememberBounded(extraManifestCache,cacheKey,{value,expires:Date.now()+30*60*1000},40);return value;
+  }).catch(()=>cached?.value||null).finally(()=>extraManifestPending.delete(cacheKey));
+  extraManifestPending.set(cacheKey,work);return work;
 }
 async function discoverSportCatalogs(sport) {
   const inputs=[["sv",STREMVERSE],["hf",HIGHFLY],["es",easySportsBase()]].filter(x=>x[1]);
@@ -1180,17 +1211,18 @@ const RETRY_MS = 30 * 1000;
 
 const sportCaches=new Map(),sportRefreshes=new Map();
 async function getSportCatalog(sport) {
-  if(sport==="football")return getCachedCatalog();
-  const now=Date.now(), cached=sportCaches.get(sport);
+  if(sport==="football"&&!scope.getStore())return getCachedCatalog();
+  const cacheKey=profileKey()+":"+sport;
+  const now=Date.now(), cached=sportCaches.get(cacheKey);
   if(cached&&cached.expires>now)return currentCatalog(cached.events);
-  if(!sportRefreshes.has(sport)){
+  if(!sportRefreshes.has(cacheKey)){
     const work=getCatalogEvents(sport).then(events=>{
-      sportCaches.set(sport,{events,expires:Date.now()+CACHE_MS,staleUntil:Date.now()+STALE_MS});return events;
-    }).finally(()=>sportRefreshes.delete(sport));
-    sportRefreshes.set(sport,work);
+      rememberBounded(sportCaches,cacheKey,{events,expires:Date.now()+CACHE_MS,staleUntil:Date.now()+STALE_MS},36);return events;
+    }).finally(()=>sportRefreshes.delete(cacheKey));
+    sportRefreshes.set(cacheKey,work);
   }
-  if(cached&&cached.staleUntil>now){sportRefreshes.get(sport).catch(()=>{});return currentCatalog(cached.events);}
-  return currentCatalog(await sportRefreshes.get(sport));
+  if(cached&&cached.staleUntil>now){sportRefreshes.get(cacheKey).catch(()=>{});return currentCatalog(cached.events);}
+  return currentCatalog(await sportRefreshes.get(cacheKey));
 }
 function currentCatalog(events) {
   const now = Date.now();
@@ -1198,6 +1230,7 @@ function currentCatalog(events) {
 }
 
 async function getCachedCatalog() {
+  if(scope.getStore())return getSportCatalog("football");
   const now = Date.now();
 
   if (catalogCache.initialized && catalogCache.expires > now) {
@@ -1716,7 +1749,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.3.0",
+    "3.4.0",
 
   name:
     "Dado Live TV",
@@ -1775,27 +1808,37 @@ app.get(
 const DEFAULT_SETTINGS=Object.freeze({
   catalogs:["football","sport"],sources:["sv","es","hf"],languages:[0,1,2,3],proxy:"all"
 });
-function safeSettings(value) {
+function safeSettings(value,legacy=false) {
   const v=value&&typeof value==="object"?value:{};
   const unique=(items,allowed)=>Array.isArray(items)?[...new Set(items.filter(x=>allowed.includes(x)))]:allowed.slice();
   const catalogs=unique(v.catalogs,DEFAULT_SETTINGS.catalogs);
-  const sources=unique(v.sources,DEFAULT_SETTINGS.sources);
+  let sources=unique(v.sources,DEFAULT_SETTINGS.sources);
+  const easyProxyURL=proxyURL(v.easyProxyURL),easyProxyPassword=easyProxyURL&&typeof v.easyProxyPassword==="string"?v.easyProxyPassword.slice(0,256):"";
+  if(!legacy&&!easyProxyURL)sources=sources.filter(x=>x!=="es");
+  if(!sources.length)sources=["sv","hf"];
   const languages=unique(v.languages,DEFAULT_SETTINGS.languages);
-  return {catalogs:catalogs.length?catalogs:DEFAULT_SETTINGS.catalogs.slice(),
+  return {easyProxyURL,easyProxyPassword,catalogs:catalogs.length?catalogs:DEFAULT_SETTINGS.catalogs.slice(),
     sources:sources.length?sources:DEFAULT_SETTINGS.sources.slice(),
     languages:[...languages,...DEFAULT_SETTINGS.languages.filter(x=>!languages.includes(x))],
     proxy:["all","direct","proxy"].includes(v.proxy)?v.proxy:"all"};
 }
 function settingsFromToken(token) {
-  if(!token)return safeSettings();
-  if(typeof token!=="string"||token.length>1024||!/^[A-Za-z0-9_-]+$/.test(token))return null;
-  try{return safeSettings(JSON.parse(Buffer.from(token,"base64url").toString("utf8")));}catch{return null;}
+  if(!token)return safeSettings({},true);
+  if(typeof token!=="string"||token.length>2200||!/^[A-Za-z0-9_-]+$/.test(token))return null;
+  const v=unseal(token);if(v)return safeSettings(v);
+  try{return safeSettings({...JSON.parse(Buffer.from(token,"base64url").toString("utf8")),easyProxyURL:"",easyProxyPassword:""});}catch{return null;}
 }
 function requestSettings(req,res) {
-  const config=settingsFromToken(req.params.settings);
+  const config=req.dadoConfig||settingsFromToken(req.params.settings);
   if(!config)res.status(400).json({error:"Invalid settings"});
   return config;
 }
+app.use("/c/:settings",(req,res,next)=>{
+ const config=settingsFromToken(req.params.settings);if(!config)return res.status(400).json({error:"Invalid settings"});
+ const base=config.sources.includes("es")?personalBase(config.easyProxyURL,config.easyProxyPassword):null;
+ if(config.sources.includes("es")&&!base)return res.status(503).json({error:"EasySports configuration unavailable"});
+ req.dadoConfig=config;res.set("Cache-Control","no-store");scope.run({base,key:base?crypto.createHash("sha256").update(base).digest("hex"):"no-es"},next);
+});
 function eventAllowed(event,config) {
   const catalog=event.sport==="tennis"||event.sport==="motors"?"sport":"football";
   return config.catalogs.includes(catalog)&&event.providers.some(p=>config.sources.includes(p.source));
@@ -1822,28 +1865,45 @@ app.get("/c/:settings/manifest.json",(req,res)=>{
 });
 
 
-function configurePage(config) {
+function configurePage(config,previousToken="") {
+  const publicConfig={...config,easyProxyPassword:""};
   // Only validated ASCII preference values are inserted into the script.
   return '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dado Live TV | Configurazione</title><style>'+
-  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.3.0</p></div></header>'+
+  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.4.0</p></div></header>'+
   '<section><h2>Cataloghi nella Home</h2><div id="catalogs"></div></section>'+
+  '<section><h2>EasyProxy · solo EasySports</h2><p>StremVerse e Highfly restano invariati. Inserisci un URL valido per abilitare EasySports.</p><label for="easyurl">URL EasyProxy</label><input class="field" id="easyurl" type="url" placeholder="http://IP:7860" autocomplete="off"><label for="easypass">Password API (facoltativa)</label><input class="field" id="easypass" type="password" autocomplete="new-password"><p id="proxystate"></p></section>'+
   '<section><h2>Fonti e priorità</h2><p>Attiva le fonti da visualizzare e ordinale a parità di lingua.</p><div id="sources"></div></section>'+
   '<section><h2>Priorità delle lingue</h2><p>La prima lingua viene mostrata per prima nei risultati.</p><div id="languages"></div></section>'+
   '<section><h2>Proxy</h2><select id="proxy" aria-label="Filtro proxy"><option value="all">Tutti i collegamenti</option><option value="direct">Senza indicazione PROXY</option><option value="proxy">Solo PROXY riconosciuti</option></select><p>Il riconoscimento dipende dai metadati. Gli eventi terminati restano esclusi.</p></section>'+
   '<div class="actions"><a class="action primary" id="install">Salva e installa su Stremio</a><button class="wide" id="copy">Copia URL di installazione</button><button class="wide" id="reset">Ripristina impostazioni predefinite</button></div><p id="status" role="status"></p><p>Le modifiche si applicano installando il nuovo URL. Non aggiungere una seconda copia: sostituisci quella precedente se necessario.</p><p><a href="/debug/sports">Diagnostica cataloghi</a> · <a href="/debug/stream-performance">Diagnostica fonti</a></p></main>'+
-  '<script>const defaults='+JSON.stringify(DEFAULT_SETTINGS)+';let config='+JSON.stringify(config)+';'+
+  '<script>const defaults='+JSON.stringify(DEFAULT_SETTINGS)+';let config='+JSON.stringify(publicConfig).replace(/</g,"\\u003c")+';const previousToken='+JSON.stringify(previousToken)+';'+
   'const labels={football:"⚽ LIVE Football",sport:"🔴 LIVE Sport",sv:"StremVerse",es:"EasySports",hf:"Highfly",0:"🇮🇹 Italiano",1:"🇬🇧 Inglese",2:"🌍 Altre lingue",3:"❔ Lingua sconosciuta"};'+
-  'const el=id=>document.getElementById(id);function row(parent,key,active,order,i,kind){const r=document.createElement("div");r.className="line";if(kind!=="languages"){const c=document.createElement("input");c.type="checkbox";c.checked=active;c.setAttribute("aria-label",labels[key]);c.onchange=()=>{const list=config[kind];if(c.checked){if(!list.includes(key))list.push(key)}else if(list.length>1)config[kind]=list.filter(x=>x!==key);else el("status").textContent="Mantieni almeno una opzione attiva.";render()};r.append(c)}'+
-  'const title=document.createElement("span");title.className="grow";title.textContent=(kind==="languages"||kind==="sources"&&active?String(i+1)+". ":"")+labels[key];r.append(title);if(order&&active){for(const d of [-1,1]){const b=document.createElement("button");b.textContent=d===-1?"↑":"↓";b.setAttribute("aria-label",(d===-1?"Sposta su ":"Sposta giù ")+labels[key]);b.disabled=i+d<0||i+d>=order.length;b.onclick=()=>{[order[i],order[i+d]]=[order[i+d],order[i]];render()};r.append(b)}}parent.append(r)}'+
-  'function manifestURL(){const token=btoa(JSON.stringify(config)).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"");return "https://dado-live-tv.onrender.com/c/"+token+"/manifest.json"}'+
-  'function render(){for(const k of ["catalogs","sources","languages"])el(k).replaceChildren();for(const k of defaults.catalogs)row(el("catalogs"),k,config.catalogs.includes(k),null,0,"catalogs");config.sources.forEach((k,i)=>row(el("sources"),k,true,config.sources,i,"sources"));defaults.sources.filter(k=>!config.sources.includes(k)).forEach(k=>row(el("sources"),k,false,null,0,"sources"));config.languages.forEach((k,i)=>row(el("languages"),k,true,config.languages,i,"languages"));el("proxy").value=config.proxy;el("install").href=manifestURL().replace("https://","stremio://")}'+
-  'el("proxy").onchange=()=>{config.proxy=el("proxy").value;render()};el("reset").onclick=()=>{config=JSON.parse(JSON.stringify(defaults));el("status").textContent="Impostazioni predefinite ripristinate.";render()};el("copy").onclick=async()=>{try{await navigator.clipboard.writeText(manifestURL());el("status").textContent="URL copiato."}catch{el("status").textContent=manifestURL()}};render();</script></body></html>';
+  'const el=id=>document.getElementById(id);function row(parent,key,active,order,i,kind){const r=document.createElement("div");r.className="line";const locked=kind==="sources"&&key==="es"&&!validURL(config.easyProxyURL);if(locked)r.className+=" disabled";if(kind!=="languages"){const c=document.createElement("input");c.type="checkbox";c.checked=active;c.disabled=locked;c.setAttribute("aria-label",labels[key]);c.onchange=()=>{const list=config[kind];if(c.checked){if(!list.includes(key))list.push(key)}else if(list.length>1)config[kind]=list.filter(x=>x!==key);else el("status").textContent="Mantieni almeno una opzione attiva.";render()};r.append(c)}'+
+  'const title=document.createElement("span");title.className="grow";title.textContent=(kind==="languages"||kind==="sources"&&active?String(i+1)+". ":"")+labels[key]+(locked?" (inserisci URL EasyProxy)":"");r.append(title);if(order&&active){for(const d of [-1,1]){const b=document.createElement("button");b.textContent=d===-1?"↑":"↓";b.setAttribute("aria-label",(d===-1?"Sposta su ":"Sposta giù ")+labels[key]);b.disabled=i+d<0||i+d>=order.length;b.onclick=()=>{[order[i],order[i+d]]=[order[i+d],order[i]];render()};r.append(b)}}parent.append(r)}'+
+  'function validURL(v){try{const u=new URL(v.trim());return ["http:","https:"].includes(u.protocol)&&!!u.hostname&&!u.username&&!u.password&&!u.search&&!u.hash&&u.pathname==="/"}catch{return false}}'+
+  'async function manifestURL(){const r=await fetch("/configure/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...config,easyProxyPassword:el("easypass").value,previousToken})});const d=await r.json();if(!r.ok)throw Error(d.error||"Errore");return d.url}'+
+  'function render(){if(!validURL(config.easyProxyURL))config.sources=config.sources.filter(k=>k!=="es");if(!config.sources.length)config.sources=["sv","hf"];for(const k of ["catalogs","sources","languages"])el(k).replaceChildren();for(const k of defaults.catalogs)row(el("catalogs"),k,config.catalogs.includes(k),null,0,"catalogs");config.sources.forEach((k,i)=>row(el("sources"),k,true,config.sources,i,"sources"));defaults.sources.filter(k=>!config.sources.includes(k)).forEach(k=>row(el("sources"),k,false,null,0,"sources"));config.languages.forEach((k,i)=>row(el("languages"),k,true,config.languages,i,"languages"));el("proxy").value=config.proxy;el("proxystate").textContent=validURL(config.easyProxyURL)?"Ora puoi selezionare EasySports.":"EasySports non selezionabile."}'+
+  'el("easyurl").value=config.easyProxyURL||"";el("easyurl").oninput=()=>{config.easyProxyURL=el("easyurl").value;render()};el("proxy").onchange=()=>{config.proxy=el("proxy").value;render()};el("reset").onclick=()=>{config=JSON.parse(JSON.stringify(defaults));config.easyProxyURL="";el("easyurl").value="";el("easypass").value="";render()};async function save(action){const status=el("status");try{status.textContent="Salvataggio…";const url=await manifestURL();if(action==="copy"){try{await navigator.clipboard.writeText(url);status.textContent="URL copiato."}catch{status.textContent=url}}else{status.textContent="Apri Stremio per aggiornare.";location.href=url.replace("https://","stremio://")}}catch(e){status.textContent=e.message}}el("install").onclick=e=>{e.preventDefault();save("install")};el("copy").onclick=()=>save("copy");render();</script></body></html>';
 }
 app.get(["/configure","/c/:settings/configure"],(req,res)=>{
-  const config=requestSettings(req,res);if(!config)return;
-  res.set("Cache-Control","no-store");
-  res.type("html").send(configurePage(config));
+  const config=req.params.settings?requestSettings(req,res):safeSettings();if(!config)return;
+  res.set("Cache-Control","no-store");res.set("Referrer-Policy","no-referrer");res.type("html").send(configurePage(config,req.params.settings||""));
 });
+
+app.post("/configure/save",async(req,res)=>{
+ res.set("Cache-Control","no-store");const v=req.body||{};
+ if(typeof v.easyProxyURL==="string"&&v.easyProxyURL.trim()&&!proxyURL(v.easyProxyURL))return res.status(400).json({error:"URL EasyProxy non valido"});
+ if(typeof v.easyProxyPassword==="string"&&v.easyProxyPassword.length>256)return res.status(400).json({error:"Password troppo lunga"});
+ const prior=typeof v.previousToken==="string"&&v.previousToken.length<=2200?unseal(v.previousToken):null,config=safeSettings(v);
+ if(!config.easyProxyPassword&&prior?.easyProxyURL===config.easyProxyURL)config.easyProxyPassword=prior.easyProxyPassword||"";
+ if(config.sources.includes("es")){
+   const base=personalBase(config.easyProxyURL,config.easyProxyPassword);
+   if(!base)return res.status(503).json({error:"Formato EasySports non riconosciuto; configurazione originale conservata"});
+   try{const m=await getJsonRaw(base+"/manifest.json",6000);if(!Array.isArray(m.catalogs))throw Error("manifest");}catch{return res.status(502).json({error:"EasySports non ha accettato la configurazione"});}
+ }
+ try{res.json({url:"https://dado-live-tv.onrender.com/c/"+seal(config)+"/manifest.json"});}catch{res.status(503).json({error:"Salvataggio protetto non disponibile"});}
+});
+app.get("/debug/easyproxy-config",(req,res)=>{const t=proxyTemplate();res.set("Cache-Control","no-store");res.json({legacyConfigured:!!legacyEasySportsBase(),templateRecognized:!!t,passwordSupported:!!t?.pw,encryptionReady:!!encryptionKey()});});
 
 /* =========================================================
    LOGO PERSONALIZZATO DADO LIVE TV
@@ -2202,11 +2262,12 @@ app.get(["/stream/tv/:id.json","/c/:settings/stream/tv/:id.json"], async (req, r
   try {
     // Fast path avoids even a catalog refresh for an immediate retry.
     const config=requestSettings(req,res);if(!config)return;
-    const cached=readCachedStreams(req.params.id);
+    const cacheId=profileKey()+":"+req.params.id;
+    const cached=readCachedStreams(cacheId);
     if(cached&&!req.params.settings)return res.json({streams:configuredStreamList(cached,config)});
     const event=await findEvent(req.params.id);
     if(!event||!eventAllowed(event,config))return res.json({streams:[]});
-    const entries=cached||await getCachedStreams(req.params.id,event);
+    const entries=cached||await getCachedStreams(cacheId,event);
     res.json({streams:configuredStreamList(entries,config)});
   } catch (error) {
     console.error("Stream error:", error);
