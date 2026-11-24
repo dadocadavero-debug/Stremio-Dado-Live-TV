@@ -1899,7 +1899,8 @@ function labelStream(stream,source){
   const channel=displayChannel(stream);
   const proxy=isProxyStream(stream);
   const label=lang.label.replace(/\s+(?:IT|EN)$/,"");
-  const name=(names[source]||source)+"\n"+[label,channel,proxy?"[PROXY]":""].filter(Boolean).join(" • ");
+  const channelLabel=label==="🇮🇹"?channel.replace(/\s+(?:IT|ITA|ITALIA)$/i,""):label==="🇬🇧"?channel.replace(/\s+(?:UK|EN|ENG)$/i,""):channel;
+  const name=[names[source]||source,proxy?"[PROXY]":"",label,channelLabel].filter(Boolean).join(" ");
   return {stream:{...stream,name},rank:lang.rank,sourceRank:STREAM_SOURCE_RANK[source]??99};
 }
 function sortStreamEntries(entries){
