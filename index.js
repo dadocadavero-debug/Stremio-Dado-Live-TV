@@ -1738,6 +1738,100 @@ async function renderPortrait(id, source, version) {
   return work;
 }
 
+
+/* Private access: invitation hashes in Render environment, no external database. */
+const ACCESS_ORIGIN="https://dado-live-tv.onrender.com";
+const accessActivity=new Map();
+const localLoginAttempts=new Map();
+function accessHash(s){return crypto.createHash("sha256").update(s).digest("hex")}
+function accessEqual(a,b){return typeof a==="string"&&typeof b==="string"&&crypto.timingSafeEqual(Buffer.from(accessHash(a)),Buffer.from(accessHash(b)))}
+function validAccessId(id){return typeof id==="string"&&/^[a-z0-9_-]{1,40}$/.test(id)}
+function loadAccessUsers(){
+  const registry=new Map();
+  try{
+    const entries=JSON.parse(process.env.DADO_ACCESS_USERS||"[]");
+    if(!Array.isArray(entries)||entries.length>100)return registry;
+    for(const u of entries){
+      if(!u||!validAccessId(u.id)||registry.has(u.id)||typeof u.hash!=="string"||!/^[a-f0-9]{64}$/.test(u.hash)||typeof u.name!=="string"||typeof u.active!=="boolean")return new Map();
+      registry.set(u.id,{id:u.id,name:u.name,hash:u.hash,active:u.active});
+    }
+  }catch{return new Map()}
+  return registry;
+}
+const accessUsers=loadAccessUsers();
+function accessReady(){return accessUsers.size>0&&!!encryptionKey()}
+function accessUser(id){return validAccessId(id)?accessUsers.get(id)||null:null}
+function accessTouch(id){accessActivity.set(id,Date.now())}
+function accessCookie(req,name){
+  const raw=(req.headers.cookie||"").split(";").map(x=>x.trim()).find(x=>x.startsWith(name+"="));
+  if(!raw)return null;const value=raw.slice(name.length+1);if(!/^[A-Za-z0-9_-]{1,2200}$/.test(value))return null;
+  const p=unseal(value);return p&&Number.isFinite(p.exp)&&p.exp>Date.now()?p:null;
+}
+function ownerSession(req){const u=accessUser(userSession(req));return !!(u?.active&&u.id==="owner");}
+function setAccessCookie(res,name,payload,seconds){res.cookie(name,seal({...payload,exp:Date.now()+seconds*1000}),{httpOnly:true,secure:true,sameSite:"strict",path:"/",maxAge:seconds*1000});}
+function userSession(req){const p=accessCookie(req,"dado_user");return p?.kind==="user-session"&&validAccessId(p.uid)?p.uid:null;}
+function privateEnvelope(token){
+  if(typeof token!=="string"||!/^[A-Za-z0-9_-]{1,3500}$/.test(token))return null;
+  const p=unseal(token);return p?.kind==="addon-v1"&&validAccessId(p.uid)&&p.config&&typeof p.config==="object"?p:null;
+}
+function accessPage(title,body,js=""){
+  return '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+title+' | Dado Live TV</title><style>:root{color-scheme:dark;font:16px system-ui;background:#11131b;color:#f1f2f6}body{margin:0;padding:24px 16px}main{max-width:580px;margin:auto}header{display:flex;align-items:center;gap:14px}header img{width:56px;border-radius:12px}h1{font-size:22px}p,small{color:#b5bac9}section{background:#20232e;border:1px solid #343747;border-radius:14px;padding:18px;margin:16px 0}input,button,a.action{box-sizing:border-box;font:inherit;padding:12px;border-radius:9px;border:1px solid #484d60;background:#2c303d;color:#fff}input{width:100%;margin:8px 0}button{cursor:pointer}button.primary{background:#29bc75;color:#082519;font-weight:700;width:100%}button:disabled{opacity:.45}a{color:#8dbbff}article{border-top:1px solid #484d60;padding:12px 0;display:grid;gap:8px}#status,#code{overflow-wrap:anywhere;white-space:pre-wrap}label{display:block;margin-top:8px}</style></head><body><main><header><img src="/logo.png" alt=""><h1>'+title+'</h1></header>'+body+'</main><script>'+js+'</script></body></html>';
+}
+const accessClient=String.raw`
+const el=id=>document.getElementById(id);
+async function post(url,data){const r=await fetch(url,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});const d=await r.json();if(!r.ok)throw Error(d.error||"Operazione non riuscita");return d}
+function showError(e){el("status").textContent=e.message}
+`;
+function loginPage(){
+  return accessPage("Dado Live TV — Accesso riservato",'<section><p>Accesso esclusivamente su invito.</p><form id="form"><label for="secret">Codice di invito personale</label><input id="secret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required><button class="primary">Accedi</button></form><p id="status" role="status"></p><p>Richiedi un codice all’amministratore.</p></section>',accessClient+'el("form").onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector("button");b.disabled=true;try{await post("/access/login",{secret:el("secret").value.trim()});location.replace("/configure")}catch(e){showError(e);b.disabled=false}}');
+}
+function accessFail(res){return res.status(503).json({error:"Servizio accessi non disponibile."})}
+function accessDenied(res){return res.status(403).json({error:"Accesso privato: richiedi un invito."})}
+function accessAsync(fn){return (req,res,next)=>Promise.resolve(fn(req,res,next)).catch(()=>{if(!res.headersSent)accessFail(res)})}
+function sameOrigin(req){return req.get("Origin")===ACCESS_ORIGIN&&req.is("application/json")}
+function loginAllowed(req){
+ const key=req.ip||"unknown",now=Date.now(),previous=localLoginAttempts.get(key);
+ if(localLoginAttempts.size>2000)for(const [k,v] of localLoginAttempts)if(v.until<=now)localLoginAttempts.delete(k);
+ if(localLoginAttempts.size>5000&&!previous)return false;
+ const state=previous&&previous.until>now?previous:{count:0,until:now+600000};state.count++;localLoginAttempts.set(key,state);return state.count<=20;
+}
+// Public entry points and image assets only. All other paths are denied by default.
+app.use(accessAsync(async(req,res,next)=>{
+  const path=req.path;
+  if(path==="/logo.png"||/^\/artwork\/v[1-6]\/[a-f0-9]+\.jpg$/.test(path))return next();
+  res.set("Cache-Control","no-store");res.set("Referrer-Policy","no-referrer");
+  if(!accessReady())return accessFail(res);
+  if(path==="/"&&req.method==="GET")return res.redirect("/configure");
+  if(path==="/access/login"||path==="/access")return next();
+  if(path==="/admin"||path.startsWith("/debug/"))return ownerSession(req)?next():accessDenied(res);
+  const m=path.match(/^\/c\/([A-Za-z0-9_-]{1,3500})(?:\/|$)/);
+  if(m){
+    const p=privateEnvelope(m[1]);if(!p)return accessDenied(res);
+    const u=await accessUser(p.uid);if(!u?.active)return accessDenied(res);
+    req.accessUid=u.id;req.accessConfig=p.config;await accessTouch(u.id);
+    if(path==="/c/"+m[1]+"/configure"&&req.method==="GET")setAccessCookie(res,"dado_user",{kind:"user-session",uid:u.id},30*86400);
+    return next();
+  }
+  if(path==="/configure"||path==="/configure/save"){
+    const uid=userSession(req),u=uid?await accessUser(uid):null;
+    if(!u?.active)return path==="/configure"&&req.method==="GET"?res.type("html").send(loginPage()):accessDenied(res);
+    req.accessUid=u.id;await accessTouch(u.id);return next();
+  }
+  return accessDenied(res);
+}));
+app.get("/access",(req,res)=>res.redirect("/configure"));
+app.post("/access/login",accessAsync(async(req,res)=>{
+ if(!sameOrigin(req))return accessDenied(res);if(!loginAllowed(req))return res.status(429).json({error:"Troppi tentativi. Riprova tra 10 minuti."});
+ const code=req.body?.secret;if(typeof code!=="string"||!/^[A-Za-z0-9_-]{32,128}$/.test(code))return res.status(401).json({error:"Codice non valido."});
+ const hash=accessHash(code);let user=null;
+ for(const u of accessUsers.values()){if(accessEqual(u.hash,hash)&&u.active)user=u}
+ if(!user)return res.status(401).json({error:"Codice non valido o revocato."});
+ setAccessCookie(res,"dado_user",{kind:"user-session",uid:user.id},30*86400);accessTouch(user.id);res.json({ok:true});
+}));
+app.get("/admin",(req,res)=>{
+ const users=[...accessUsers.values()].map(u=>({name:u.name,active:u.active,lastSeen:accessActivity.get(u.id)||null}));
+ res.type("html").send(accessPage("Dado Live TV — Accessi",'<section><p>Elenco in sola lettura. Per creare o revocare inviti modifica DADO_ACCESS_USERS su Render e ridistribuisci il servizio.</p><p>L’attività è conservata soltanto nella memoria del processo.</p><div id="users"></div></section><p><a href="/configure">Configurazione addon</a></p>', 'const users='+JSON.stringify(users).replace(/</g,"\\u003c")+';for(const u of users){const a=document.createElement("article"),n=document.createElement("strong"),d=document.createElement("small");n.textContent=u.name;d.textContent=(u.active?"Attivo":"Revocato")+" · Ultima attività: "+(u.lastSeen?new Date(u.lastSeen).toLocaleString("it-IT",{timeZone:"Europe/Rome"}):"non rilevata");a.append(n,d);document.getElementById("users").append(a)}'));
+});
 app.get(["/artwork/v1/:id.jpg", "/artwork/v2/:id.jpg", "/artwork/v3/:id.jpg", "/artwork/v4/:id.jpg", "/artwork/v5/:id.jpg", "/artwork/v6/:id.jpg"], async (req, res) => {
   const id = req.params.id;
   const version = req.path.startsWith("/artwork/v6/") ? "v6" : req.path.startsWith("/artwork/v5/") ? "v5" : req.path.startsWith("/artwork/v4/") ? "v4" : req.path.startsWith("/artwork/v3/") ? "v3" : req.path.startsWith("/artwork/v2/") ? "v2" : "v1";
@@ -1812,7 +1906,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.4.4",
+    "3.5.1",
 
   name:
     "Dado Live TV",
@@ -1885,19 +1979,13 @@ function safeSettings(value,legacy=false) {
     languages:[...languages,...DEFAULT_SETTINGS.languages.filter(x=>!languages.includes(x))],
     proxy:["all","direct","proxy"].includes(v.proxy)?v.proxy:"all"};
 }
-function settingsFromToken(token) {
-  if(!token)return safeSettings({},true);
-  if(typeof token!=="string"||token.length>2200||!/^[A-Za-z0-9_-]+$/.test(token))return null;
-  const v=unseal(token);if(v)return safeSettings(v);
-  try{return safeSettings({...JSON.parse(Buffer.from(token,"base64url").toString("utf8")),easyProxyURL:"",easyProxyPassword:""});}catch{return null;}
-}
 function requestSettings(req,res) {
-  const config=req.dadoConfig||settingsFromToken(req.params.settings);
-  if(!config)res.status(400).json({error:"Invalid settings"});
+  const config=req.dadoConfig;
+  if(!config)accessDenied(res);
   return config;
 }
 app.use("/c/:settings",(req,res,next)=>{
- const config=settingsFromToken(req.params.settings);if(!config)return res.status(400).json({error:"Invalid settings"});
+ const config=req.accessConfig?safeSettings(req.accessConfig):null;if(!config)return accessDenied(res);
  const base=config.sources.includes("es")?personalBase(config.easyProxyURL,config.easyProxyPassword):null;
  if(config.sources.includes("es")&&!base)return res.status(503).json({error:"EasySports configuration unavailable"});
  req.dadoConfig=config;res.set("Cache-Control","no-store");scope.run({base,key:base?crypto.createHash("sha256").update(base).digest("hex"):"no-es"},next);
@@ -1932,13 +2020,13 @@ function configurePage(config,previousToken="") {
   const publicConfig={...config,easyProxyPassword:""};
   // Only validated ASCII preference values are inserted into the script.
   return '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dado Live TV | Configurazione</title><style>'+
-  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}a.action[aria-disabled="true"]{opacity:.4;cursor:default}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.4.4</p></div></header>'+
+  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}a.action[aria-disabled="true"]{opacity:.4;cursor:default}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.5.1</p></div></header>'+
   '<section><h2>Cataloghi nella Home</h2><div id="catalogs"></div></section>'+
   '<section><h2>EasyProxy · solo EasySports</h2><p>StremVerse e Highfly restano invariati. Inserisci un URL valido per abilitare EasySports.</p><label for="easyurl">URL EasyProxy</label><input class="field" id="easyurl" type="url" placeholder="http://IP:7860" autocomplete="off"><label for="easypass">Password API (facoltativa)</label><input class="field" id="easypass" type="password" autocomplete="new-password"><p id="proxystate"></p></section>'+
   '<section><h2>Fonti e priorità</h2><p>Attiva le fonti da visualizzare e ordinale a parità di lingua.</p><div id="sources"></div></section>'+
   '<section><h2>Priorità delle lingue</h2><p>La prima lingua viene mostrata per prima nei risultati.</p><div id="languages"></div></section>'+
   '<section><h2>Proxy</h2><select id="proxy" aria-label="Filtro proxy"><option value="all">Tutti i collegamenti</option><option value="direct">Senza indicazione PROXY</option><option value="proxy">Solo PROXY riconosciuti</option></select><p>Il riconoscimento dipende dai metadati. Gli eventi terminati restano esclusi.</p></section>'+
-  '<div class="actions"><a class="action primary" id="install" aria-disabled="true">Installa addon su Stremio</a><button class="wide" id="copy" disabled>Copia URL di installazione</button><button class="wide" id="reset">Ripristina impostazioni predefinite</button></div><p id="status" role="status"></p><p>Il collegamento viene preparato automaticamente dopo ogni modifica. Le impostazioni si applicano installando il nuovo URL. Non aggiungere una seconda copia: sostituisci quella precedente se necessario.</p><p><a href="/debug/sports">Diagnostica cataloghi</a> · <a href="/debug/stream-performance">Diagnostica fonti</a></p></main>'+
+  '<div class="actions"><a class="action primary" id="install" aria-disabled="true">Installa addon su Stremio</a><button class="wide" id="copy" disabled>Copia URL di installazione</button><button class="wide" id="reset">Ripristina impostazioni predefinite</button></div><p id="status" role="status"></p><p>Il collegamento viene preparato automaticamente dopo ogni modifica. Le impostazioni si applicano installando il nuovo URL. Non aggiungere una seconda copia: sostituisci quella precedente se necessario.</p></main>'+
   '<script>const defaults='+JSON.stringify(DEFAULT_SETTINGS)+';let config='+JSON.stringify(publicConfig).replace(/</g,"\\u003c")+';const previousToken='+JSON.stringify(previousToken)+';'+
   'const labels={football:"⚽ LIVE Football",sport:"🔴 LIVE Sport",sv:"StremVerse",es:"EasySports",hf:"Highfly",0:"🇮🇹 Italiano",1:"🇬🇧 Inglese",2:"🌍 Altre lingue",3:"❔ Lingua sconosciuta"};'+
   'const el=id=>document.getElementById(id);function row(parent,key,active,order,i,kind){const r=document.createElement("div");r.className="line";const locked=kind==="sources"&&key==="es"&&!validURL(config.easyProxyURL);if(locked)r.className+=" disabled";if(kind!=="languages"){const c=document.createElement("input");c.type="checkbox";c.checked=active;c.disabled=locked;c.setAttribute("aria-label",labels[key]);c.onchange=()=>{const list=config[kind];if(c.checked){if(!list.includes(key))list.push(key)}else if(list.length>1)config[kind]=list.filter(x=>x!==key);else el("status").textContent="Mantieni almeno una opzione attiva.";render()};r.append(c)}'+
@@ -1956,14 +2044,15 @@ app.post("/configure/save",async(req,res)=>{
  res.set("Cache-Control","no-store");const v=req.body||{};
  if(typeof v.easyProxyURL==="string"&&v.easyProxyURL.trim()&&!proxyURL(v.easyProxyURL))return res.status(400).json({error:"URL EasyProxy non valido"});
  if(typeof v.easyProxyPassword==="string"&&v.easyProxyPassword.length>256)return res.status(400).json({error:"Password troppo lunga"});
- const prior=typeof v.previousToken==="string"&&v.previousToken.length<=2200?unseal(v.previousToken):null,config=safeSettings(v);
+ if(!sameOrigin(req)||!req.accessUid)return accessDenied(res);
+ const envelope=privateEnvelope(v.previousToken),prior=envelope?.uid===req.accessUid?envelope.config:null,config=safeSettings(v);
  if(!config.easyProxyPassword&&prior?.easyProxyURL===config.easyProxyURL)config.easyProxyPassword=prior.easyProxyPassword||"";
  if(config.sources.includes("es")){
    const base=personalBase(config.easyProxyURL,config.easyProxyPassword);
    if(!base)return res.status(503).json({error:"Formato EasySports non riconosciuto; configurazione originale conservata"});
    try{const m=await getJsonRaw(base+"/manifest.json",6000);if(!Array.isArray(m.catalogs))throw Error("manifest");}catch{return res.status(502).json({error:"EasySports non ha accettato la configurazione"});}
  }
- try{res.json({url:"https://dado-live-tv.onrender.com/c/"+seal(config)+"/manifest.json"});}catch{res.status(503).json({error:"Salvataggio protetto non disponibile"});}
+ try{res.json({url:"https://dado-live-tv.onrender.com/c/"+seal({kind:"addon-v1",uid:req.accessUid,config})+"/manifest.json"});}catch{res.status(503).json({error:"Salvataggio protetto non disponibile"});}
 });
 app.get("/debug/easyproxy-config",(req,res)=>{const t=proxyTemplate();res.set("Cache-Control","no-store");res.json({legacyConfigured:!!legacyEasySportsBase(),templateRecognized:!!(t||pipeTemplate()),passwordSupported:!!(t?.pw||pipeTemplate()),encryptionReady:!!encryptionKey(),schema:easySportsSchema()});});
 
