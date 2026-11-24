@@ -447,6 +447,33 @@ const PROVIDER_CATALOGS = [
    RECUPERO EVENTI
 ========================================================= */
 
+// Classify the sport before checking team names: England, Barcelona etc.
+// can also refer to cricket, basketball and other sports.
+function sportText(value) {
+  if (Array.isArray(value)) return value.map(sportText).join(" ");
+  if (value && typeof value === "object") return sportText(value.name || value.title || value.id || "");
+  return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+function isOtherSport(value) {
+  return /\b(?:basketball|basket|pallacanestro|baloncesto|nba|wnba|euroleague|cricket|ipl|bbl|t20|odi|baseball|mlb|softball|rugby|nfl|ncaa football|american football|football americano|futbol americano|australian football|aussie rules|gaelic football|hockey|nhl|tennis|atp|wta|volleyball|pallavolo|handball|darts|snooker|boxing|mma|ufc|wrestling|motorsport|formula 1|f1|golf|cycling|esports|futsal|beach soccer)\b/.test(sportText(value));
+}
+function isFootballSport(value) {
+  const t = sportText(value);
+  return !isOtherSport(t) && /\b(?:football|soccer|calcio|futbol|futebol|association football)\b/.test(t);
+}
+function easySportsFootballMeta(meta, catalog) {
+  const structured = [meta.sport, meta.sportName, meta.genre, meta.genres,
+    meta.category, meta.categories, meta.league, meta.competition];
+  const title = [meta.name, meta.title, meta.id];
+  // A mixed-catalog event must supply affirmative football evidence.
+  if (structured.some(isOtherSport) || title.some(isOtherSport)) return false;
+  if (isOtherSport(meta.description)) return false;
+  return catalog.footballOnly || structured.some(isFootballSport) ||
+    title.some(isFootballSport) || isFootballSport(meta.description) ||
+    /\b(?:serie a|serie b|premier league|la liga|bundesliga|ligue 1|uefa|fifa|copa libertadores|copa sudamericana|eredivisie|primeira liga|championship)\b/.test(sportText([...structured, ...title, meta.description]));
+}
+
 // Discover the catalog IDs and types from the configured Stremio manifest.
 // The existing event filter remains responsible for selecting the wanted teams.
 async function getEasySportsCatalogs() {
@@ -462,10 +489,10 @@ async function getEasySportsCatalogs() {
       if (!catalog?.id || !catalog.type) continue;
       const extras = Array.isArray(catalog.extra) ? catalog.extra : [];
       const genre = extras.find(extra => extra.name === "genre");
-      const football = genre?.options?.find(option =>
-        /football|soccer|calcio|f[uú]tbol/i.test(String(option)) &&
-        !/american|americano/i.test(String(option))
-      );
+      const football = genre?.options?.find(option => isFootballSport(option));
+      const label = [catalog.id, catalog.name, catalog.type];
+      if (isOtherSport(label) && !football) continue;
+      const footballOnly = !!football || isFootballSport(label);
       const required = [...extras.filter(extra => extra.isRequired).map(extra => extra.name),
         ...(catalog.extraRequired || [])];
       if (required.some(name => name !== "genre" || !football)) continue;
@@ -474,13 +501,14 @@ async function getEasySportsCatalogs() {
         source: "es",
         type: catalog.type,
         url: `${base}/catalog/${encodeURIComponent(catalog.type)}/${encodeURIComponent(catalog.id)}${suffix}.json`,
-        priority: /football|soccer|calcio|f[uú]tbol|live|today|sport/i.test(
-          `${catalog.id} ${catalog.name || ""}`
-        ) || !!football
+        footballOnly,
+        priority: /live|today|sport/i.test(`${catalog.id} ${catalog.name || ""}`)
       });
     }
+    const footballCatalogs = catalogs.filter(catalog => catalog.footballOnly);
     const preferred = catalogs.filter(catalog => catalog.priority);
-    const selected = preferred.length ? preferred : catalogs;
+    const selected = footballCatalogs.length ? footballCatalogs :
+      (preferred.length ? preferred : catalogs);
     easySportsCatalogCache = {
       expires: Date.now() + 5 * 60 * 1000,
       catalogs: selected
@@ -543,6 +571,9 @@ async function getProviderEvents() {
 ) {
 
   if (!meta?.id) {
+    continue;
+  }
+  if (source === "es" && !easySportsFootballMeta(meta, catalogs[index])) {
     continue;
   }
 
