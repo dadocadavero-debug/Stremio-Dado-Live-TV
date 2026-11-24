@@ -1742,6 +1742,9 @@ async function renderPortrait(id, source, version) {
 /* Private access: invitation hashes in Render environment, no external database. */
 const ACCESS_ORIGIN="https://dado-live-tv.onrender.com";
 const accessActivity=new Map();
+const accessStats=new Map();
+const accessStartedAt=Date.now();
+const adminVerifier=process.env.DADO_ADMIN_VERIFIER||"";
 const localLoginAttempts=new Map();
 function accessHash(s){return crypto.createHash("sha256").update(s).digest("hex")}
 function accessEqual(a,b){return typeof a==="string"&&typeof b==="string"&&crypto.timingSafeEqual(Buffer.from(accessHash(a)),Buffer.from(accessHash(b)))}
@@ -1767,7 +1770,18 @@ function accessCookie(req,name){
   if(!raw)return null;const value=raw.slice(name.length+1);if(!/^[A-Za-z0-9_-]{1,2200}$/.test(value))return null;
   const p=unseal(value);return p&&Number.isFinite(p.exp)&&p.exp>Date.now()?p:null;
 }
-function ownerSession(req){const u=accessUser(userSession(req));return !!(u?.active&&u.id==="owner");}
+function adminReady(){return /^[a-f0-9]{32}:[a-f0-9]{64}$/.test(adminVerifier)&&!!accessUser("owner")?.active;}
+function verifyAdminPassword(password){
+  if(!adminReady()||typeof password!=="string"||password.length<12||password.length>256)return false;
+  const [salt,hash]=adminVerifier.split(":");
+  const actual=crypto.scryptSync(password,Buffer.from(salt,"hex"),32,{N:16384,r:8,p:1});
+  return crypto.timingSafeEqual(actual,Buffer.from(hash,"hex"));
+}
+function ownerSession(req){const p=accessCookie(req,"dado_admin");return adminReady()&&p?.kind==="admin-session-v2"&&accessEqual(p.verifier,accessHash(adminVerifier));}
+function accessStat(id){if(!accessStats.has(id))accessStats.set(id,{requests:0,streams:0,lastEvent:null,sources:{sv:0,hf:0,es:0}});return accessStats.get(id)}
+function recordAccess(req,id){accessTouch(id);if(req.method==="GET"&&/\/(?:manifest\.json|catalog\/|meta\/|stream\/)/.test(req.path)){const t=accessStat(id);t.requests++;if(/\/stream\//.test(req.path))t.streams++;}}
+function recordStream(req,event,entries,config){if(!req.accessUid||!event)return;const t=accessStat(req.accessUid);t.lastEvent=String(event.name||"").slice(0,160);for(const key of ["sv","hf","es"])if(config.sources.includes(key)&&entries.some(e=>e.sourceRank===STREAM_SOURCE_RANK[key]&&(config.proxy==="all"||(config.proxy==="proxy")===e.proxy)))t.sources[key]++;}
+
 function setAccessCookie(res,name,payload,seconds){res.cookie(name,seal({...payload,exp:Date.now()+seconds*1000}),{httpOnly:true,secure:true,sameSite:"strict",path:"/",maxAge:seconds*1000});}
 function userSession(req){const p=accessCookie(req,"dado_user");return p?.kind==="user-session"&&validAccessId(p.uid)?p.uid:null;}
 function privateEnvelope(token){
@@ -1783,7 +1797,10 @@ async function post(url,data){const r=await fetch(url,{method:"POST",credentials
 function showError(e){el("status").textContent=e.message}
 `;
 function loginPage(){
-  return accessPage("Dado Live TV — Accesso riservato",'<section><p>Accesso esclusivamente su invito.</p><form id="form"><label for="secret">Codice di invito personale</label><input id="secret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required><button class="primary">Accedi</button></form><p id="status" role="status"></p><p>Richiedi un codice all’amministratore.</p></section>',accessClient+'el("form").onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector("button");b.disabled=true;try{await post("/access/login",{secret:el("secret").value.trim()});location.replace("/configure")}catch(e){showError(e);b.disabled=false}}');
+  return accessPage("Dado Live TV — Accesso riservato",'<section><p>Accesso esclusivamente su invito.</p><form id="form"><label for="secret">Codice di invito personale</label><input id="secret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required><button class="primary">Accedi</button></form><p id="status" role="status"></p><p>Richiedi un codice all’amministratore.</p><p><a href="/admin">Accesso amministratore</a></p></section>',accessClient+'el("form").onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector("button");b.disabled=true;try{await post("/access/login",{secret:el("secret").value.trim()});location.replace("/configure")}catch(e){showError(e);b.disabled=false}}');
+}
+function adminLoginPage(){
+ return accessPage("Dado Live TV — Admin",'<section><form id="form"><label for="secret">Password amministratore</label><input id="secret" type="password" autocomplete="current-password" required><button class="primary">Accedi</button></form><p id="status" role="status"></p><p><a href="/configure">Accesso con invito</a></p></section>',accessClient+'el("form").onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector("button");b.disabled=true;try{await post("/admin/login",{secret:el("secret").value});location.replace("/admin")}catch(e){showError(e);b.disabled=false}}');
 }
 function accessFail(res){return res.status(503).json({error:"Servizio accessi non disponibile."})}
 function accessDenied(res){return res.status(403).json({error:"Accesso privato: richiedi un invito."})}
@@ -1802,18 +1819,18 @@ app.use(accessAsync(async(req,res,next)=>{
   res.set("Cache-Control","no-store");res.set("Referrer-Policy","no-referrer");
   if(!accessReady())return accessFail(res);
   if(path==="/"&&req.method==="GET")return res.redirect("/configure");
-  if(path==="/access/login"||path==="/access")return next();
-  if(path==="/admin"||path.startsWith("/debug/"))return ownerSession(req)?next():accessDenied(res);
+  if(path==="/access/login"||path==="/access"||path==="/admin"||path==="/admin/login")return next();
+  if(path==="/admin/logout"||path.startsWith("/debug/"))return ownerSession(req)?next():accessDenied(res);
   const m=path.match(/^\/c\/([A-Za-z0-9_-]{1,3500})(?:\/|$)/);
   if(m){
     const p=privateEnvelope(m[1]);if(!p)return accessDenied(res);
     const u=await accessUser(p.uid);if(!u?.active)return accessDenied(res);
-    req.accessUid=u.id;req.accessConfig=p.config;await accessTouch(u.id);
+    req.accessUid=u.id;req.accessConfig=p.config;recordAccess(req,u.id);
     if(path==="/c/"+m[1]+"/configure"&&req.method==="GET")setAccessCookie(res,"dado_user",{kind:"user-session",uid:u.id},30*86400);
     return next();
   }
   if(path==="/configure"||path==="/configure/save"){
-    const uid=userSession(req),u=uid?await accessUser(uid):null;
+    const uid=ownerSession(req)?"owner":userSession(req),u=uid?await accessUser(uid):null;
     if(!u?.active)return path==="/configure"&&req.method==="GET"?res.type("html").send(loginPage()):accessDenied(res);
     req.accessUid=u.id;await accessTouch(u.id);return next();
   }
@@ -1824,13 +1841,37 @@ app.post("/access/login",accessAsync(async(req,res)=>{
  if(!sameOrigin(req))return accessDenied(res);if(!loginAllowed(req))return res.status(429).json({error:"Troppi tentativi. Riprova tra 10 minuti."});
  const code=req.body?.secret;if(typeof code!=="string"||!/^[A-Za-z0-9_-]{32,128}$/.test(code))return res.status(401).json({error:"Codice non valido."});
  const hash=accessHash(code);let user=null;
- for(const u of accessUsers.values()){if(accessEqual(u.hash,hash)&&u.active)user=u}
+ for(const u of accessUsers.values()){if(u.id!=="owner"&&accessEqual(u.hash,hash)&&u.active)user=u}
  if(!user)return res.status(401).json({error:"Codice non valido o revocato."});
  setAccessCookie(res,"dado_user",{kind:"user-session",uid:user.id},30*86400);accessTouch(user.id);res.json({ok:true});
 }));
+app.post("/admin/login",accessAsync(async(req,res)=>{
+ if(!sameOrigin(req))return accessDenied(res);
+ if(!adminReady())return accessFail(res);
+ if(!loginAllowed(req))return res.status(429).json({error:"Troppi tentativi. Riprova tra 10 minuti."});
+ if(!verifyAdminPassword(req.body?.secret))return res.status(401).json({error:"Password non valida."});
+ setAccessCookie(res,"dado_admin",{kind:"admin-session-v2",verifier:accessHash(adminVerifier)},8*3600);
+ setAccessCookie(res,"dado_user",{kind:"user-session",uid:"owner"},30*86400);
+ accessTouch("owner");res.json({ok:true});
+}));
+app.post("/admin/logout",(req,res)=>{
+ if(!sameOrigin(req))return accessDenied(res);
+ for(const name of ["dado_admin","dado_user"])res.clearCookie(name,{httpOnly:true,secure:true,sameSite:"strict",path:"/"});
+ res.json({ok:true});
+});
 app.get("/admin",(req,res)=>{
- const users=[...accessUsers.values()].map(u=>({name:u.name,active:u.active,lastSeen:accessActivity.get(u.id)||null}));
- res.type("html").send(accessPage("Dado Live TV — Accessi",'<section><p>Elenco in sola lettura. Per creare o revocare inviti modifica DADO_ACCESS_USERS su Render e ridistribuisci il servizio.</p><p>L’attività è conservata soltanto nella memoria del processo.</p><div id="users"></div></section><p><a href="/configure">Configurazione addon</a></p>', 'const users='+JSON.stringify(users).replace(/</g,"\\u003c")+';for(const u of users){const a=document.createElement("article"),n=document.createElement("strong"),d=document.createElement("small");n.textContent=u.name;d.textContent=(u.active?"Attivo":"Revocato")+" · Ultima attività: "+(u.lastSeen?new Date(u.lastSeen).toLocaleString("it-IT",{timeZone:"Europe/Rome"}):"non rilevata");a.append(n,d);document.getElementById("users").append(a)}'));
+ if(!ownerSession(req))return res.type("html").send(adminLoginPage());
+ const users=[...accessUsers.values()].map(u=>({name:u.name,owner:u.id==="owner",active:u.active,lastSeen:accessActivity.get(u.id)||null,...(accessStats.get(u.id)||{requests:0,streams:0,lastEvent:null,sources:{sv:0,hf:0,es:0}})}));
+ const data={users,started:accessStartedAt,version:"3.5.2"};
+ const body='<section><h2>Panoramica</h2><div id="summary"></div><small id="since"></small><p>Le statistiche si azzerano al riavvio. Contano richieste e fonti offerte, non le partite effettivamente viste.</p></section><section><h2>Utenti autorizzati</h2><div id="users"></div><p>Gli inviti si modificano su Render.</p><button onclick="location.reload()">Aggiorna</button></section><p><a href="/configure">Configura addon</a> · <button id="logout">Esci</button></p><p id="status" role="status"></p>';
+ const js=accessClient+'const data='+JSON.stringify(data).replace(/</g,"\\u003c")+';'+String.raw`
+const fmt=t=>t?new Date(t).toLocaleString("it-IT",{timeZone:"Europe/Rome"}):"non rilevata";
+el("summary").textContent=data.users.filter(u=>u.active).length+" autorizzati · "+data.users.filter(u=>!u.active).length+" revocati · v"+data.version;
+el("since").textContent="Statistiche dal "+fmt(data.started);
+for(const u of data.users){const a=document.createElement("article"),n=document.createElement("strong"),d=document.createElement("small"),r=document.createElement("span"),e=document.createElement("span"),f=document.createElement("small");n.textContent=u.name+(u.owner?" · Amministratore":"");d.textContent=(u.active?"Attivo":"Revocato")+" · Ultima attività: "+fmt(u.lastSeen);r.textContent="Richieste addon: "+u.requests+" · Richieste streaming: "+u.streams;e.textContent="Ultimo evento richiesto: "+(u.lastEvent||"—");f.textContent="Fonti offerte: StremVerse "+u.sources.sv+" · Highfly "+u.sources.hf+" · EasySports "+u.sources.es;a.append(n,d,r,e,f);el("users").append(a)}
+el("logout").onclick=async()=>{try{await post("/admin/logout",{});location.replace("/admin")}catch(e){showError(e)}};
+`;
+ res.type("html").send(accessPage("Dado Live TV — Admin",body,js));
 });
 app.get(["/artwork/v1/:id.jpg", "/artwork/v2/:id.jpg", "/artwork/v3/:id.jpg", "/artwork/v4/:id.jpg", "/artwork/v5/:id.jpg", "/artwork/v6/:id.jpg"], async (req, res) => {
   const id = req.params.id;
@@ -1906,7 +1947,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.5.1",
+    "3.5.2",
 
   name:
     "Dado Live TV",
@@ -2020,7 +2061,7 @@ function configurePage(config,previousToken="") {
   const publicConfig={...config,easyProxyPassword:""};
   // Only validated ASCII preference values are inserted into the script.
   return '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dado Live TV | Configurazione</title><style>'+
-  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}a.action[aria-disabled="true"]{opacity:.4;cursor:default}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.5.1</p></div></header>'+
+  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}a.action[aria-disabled="true"]{opacity:.4;cursor:default}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.5.2</p></div></header>'+
   '<section><h2>Cataloghi nella Home</h2><div id="catalogs"></div></section>'+
   '<section><h2>EasyProxy · solo EasySports</h2><p>StremVerse e Highfly restano invariati. Inserisci un URL valido per abilitare EasySports.</p><label for="easyurl">URL EasyProxy</label><input class="field" id="easyurl" type="url" placeholder="http://IP:7860" autocomplete="off"><label for="easypass">Password API (facoltativa)</label><input class="field" id="easypass" type="password" autocomplete="new-password"><p id="proxystate"></p></section>'+
   '<section><h2>Fonti e priorità</h2><p>Attiva le fonti da visualizzare e ordinale a parità di lingua.</p><div id="sources"></div></section>'+
@@ -2419,6 +2460,7 @@ app.get(["/stream/tv/:id.json","/c/:settings/stream/tv/:id.json"], async (req, r
     const event=await findEvent(req.params.id);
     if(!event||!eventAllowed(event,config))return res.json({streams:[]});
     const entries=cached||await getCachedStreams(cacheId,event);
+    recordStream(req,event,entries,config);
     res.json({streams:configuredStreamList(entries,config)});
   } catch (error) {
     console.error("Stream error:", error);
