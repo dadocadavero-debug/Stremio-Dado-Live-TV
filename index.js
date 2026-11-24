@@ -11,6 +11,13 @@ sharp.cache({ memory: 16, files: 0, items: 32 });
 
 const app = express();
 app.use(express.json());
+app.use(["/split","/sources"],(req,res,next)=>{
+  res.set("Access-Control-Allow-Origin","*");
+  res.set("Access-Control-Allow-Methods","GET, HEAD, OPTIONS");
+  res.set("Access-Control-Allow-Headers","Content-Type");
+  if(req.method==="OPTIONS")return res.sendStatus(204);
+  next();
+});
 
 const PORT = process.env.PORT || 3000;
 
@@ -1674,6 +1681,32 @@ app.get(
 );
 
 
+
+// Optional split mode: keep the original addon and its endpoints unchanged.
+// Only this catalog-only manifest should be installed alongside the three
+// source manifests, otherwise the original combined stream list duplicates them.
+const SPLIT_SOURCES=Object.freeze({sv:"StremVerse",es:"EasySports",hf:"Highfly"});
+const splitManifest={...manifest,id:manifest.id+".split",version:"3.1.1",resources:["catalog","meta"],description:"Catalogo calcio Dado Live TV - installare i filtri delle fonti separatamente"};
+function sourceManifest(source) {
+  return {
+    id:manifest.id+".source."+source,
+    version:"3.1.1",
+    name:SPLIT_SOURCES[source],
+    description:"Link "+SPLIT_SOURCES[source]+" per il catalogo Dado Live TV",
+    logo:manifest.logo,
+    resources:["stream"],
+    types:["tv"],
+    catalogs:[],
+    idPrefixes:["live_test:"]
+  };
+}
+app.get("/split/manifest.json",(req,res)=>res.json(splitManifest));
+app.get("/sources/:source/manifest.json",(req,res)=>{
+  const source=req.params.source;
+  if(!Object.prototype.hasOwnProperty.call(SPLIT_SOURCES,source))return res.sendStatus(404);
+  res.json(sourceManifest(source));
+});
+
 /* =========================================================
    LOGO PERSONALIZZATO DADO LIVE TV
 ========================================================= */
@@ -1688,7 +1721,7 @@ app.get("/logo.png", (req, res) => {
 ========================================================= */
 
 app.get(
-  "/catalog/tv/live_football_v5.json",
+  ["/catalog/tv/live_football_v5.json","/split/catalog/tv/live_football_v5.json"],
   async (req, res) => {
 
     try {
@@ -1767,7 +1800,7 @@ async function findEvent(id) {
 ========================================================= */
 
 app.get(
-  "/meta/tv/:id.json",
+  ["/meta/tv/:id.json","/split/meta/tv/:id.json"],
   async (req, res) => {
 
     try {
@@ -2038,6 +2071,37 @@ app.get("/stream/tv/:id.json", async (req, res) => {
     console.error("Stream error:", error);
     res.json({ streams: [] });
   }
+});
+
+
+// All source endpoints use the same original, sorted and globally deduplicated
+// stream cache. The controlled name prefix identifies the surviving provider.
+// An identical playback URL is assigned to only one source by existing ranking.
+function selectSourceStreams(streams,source) {
+  const prefix=SPLIT_SOURCES[source]+" ";
+  return streams.filter(stream=>typeof stream.name==="string"&&stream.name.startsWith(prefix));
+}
+app.get("/sources/:source/stream/tv/:id.json",async(req,res)=>{
+  const {source,id}=req.params;
+  if(!Object.prototype.hasOwnProperty.call(SPLIT_SOURCES,source))return res.sendStatus(404);
+  try {
+    const cached=readCachedStreams(id);
+    if(cached)return res.json({streams:selectSourceStreams(cached,source)});
+    const event=await findEvent(id);
+    if(!event)return res.json({streams:[]});
+    const streams=await getCachedStreams(id,event);
+    res.json({streams:selectSourceStreams(streams,source)});
+  }catch{
+    console.warn("Source filter stream request failed:",source);
+    res.json({streams:[]});
+  }
+});
+app.get("/debug/source-filters",(req,res)=>{
+  res.set("Cache-Control","no-store");
+  res.json({version:"3.1.1",originalAvailable:true,cacheSeconds:STREAM_CACHE_MS/1000,
+    split:{catalog:splitManifest.resources,sources:Object.values(SPLIT_SOURCES)},
+    cachedEvents:streamCache.size,
+    cachedSourceCounts:[...streamCache.values()].filter(value=>value.expires>Date.now()).map(value=>Object.fromEntries(Object.keys(SPLIT_SOURCES).map(source=>[source,selectSourceStreams(value.streams,source).length])))});
 });
 
 // Measured time to obtain stream lists, NOT media buffering/playback times.
