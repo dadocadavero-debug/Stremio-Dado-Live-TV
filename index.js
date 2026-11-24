@@ -81,30 +81,31 @@ function easySportsSchema(){
   const output={legacyConfigured:!!legacyEasySportsBase(),segments:[],recognized:!!proxyTemplate()};
   try{
     const u=new URL(legacyEasySportsBase());
-    const parts=u.pathname.split("/").filter(Boolean);
-    for(let i=0;i<parts.length;i++){
-      const segment={index:i,length:parts[i].length,fields:[]};
-      // Record only fixed, safe key names and types, never field values or encoded segments.
-      try{
-        const raw=decodeURIComponent(parts[i]);
-        let cfg;try{cfg=JSON.parse(Buffer.from(raw,"base64url").toString("utf8"));}catch{cfg=JSON.parse(raw);}
-        const walk=(o,path=[],depth=0)=>{
-          if(depth>5||!o||typeof o!=="object"||Array.isArray(o))return;
-          for(const [k,v] of Object.entries(o).slice(0,40)){
-            const safe=/^[a-zA-Z][a-zA-Z0-9_-]{0,35}$/.test(k)?k:"[redacted-key]";
-            const p=[...path,safe];
-            if(v&&typeof v==="object"&&!Array.isArray(v))walk(v,p,depth+1);
-            else segment.fields.push({field:p.join("."),type:Array.isArray(v)?"array":v===null?"null":typeof v,empty:v===""||v===null,url:!!proxyURL(v),httpPrefix:typeof v==="string"&&/^https?:\/\//i.test(v)});
-          }
-        };
-        if(cfg&&typeof cfg==="object"){segment.format="json";walk(cfg);}
-      }catch{segment.format="unrecognized";}
-      output.segments.push(segment);
+    for(const part of u.pathname.split("/").filter(Boolean)){
+      const raw=decodeURIComponent(part);
+      const buf=Buffer.from(raw,"base64url");
+      const decoded=buf.toString("utf8");
+      const shape=v=>({length:v.length,printable:[...v].filter(c=>c.charCodeAt(0)>=32&&c.charCodeAt(0)<=126).length,
+        startsObject:v.trimStart().startsWith("{"),startsArray:v.trimStart().startsWith("["),startsQuote:v.trimStart().startsWith('"'),
+        startsHttp:/^https?:\/\//i.test(v),containsHttp:/https?:\/\//i.test(v),containsEncodedHttp:/https?%3a/i.test(v),
+        percent: v.includes("%"), equals:v.includes("="), ampersand:v.includes("&"), pipe:v.includes("|"), colon:v.includes(":"), semicolon:v.includes(";"), comma:v.includes(","),
+        base64Like:/^[A-Za-z0-9+/_=-]+$/.test(v),hexLike:/^[0-9a-f]+$/i.test(v)});
+      const seg={encoded:shape(raw),decoded:shape(decoded),byteLength:buf.length,
+        gzip:buf[0]===31&&buf[1]===139,zlib:buf[0]===120,utf8Bom:buf[0]===239&&buf[1]===187&&buf[2]===191};
+      let cfg;
+      for(const [format,value] of [["raw",raw],["base64",decoded],["base64-url-escaped",(()=>{try{return decodeURIComponent(decoded)}catch{return ""}})()],["double-base64",Buffer.from(decoded,"base64url").toString("utf8")]]){
+        try{let p=JSON.parse(value);if(typeof p==="string")p=JSON.parse(p);if(p&&typeof p==="object"){cfg=p;seg.format=format;break;}}catch{}
+      }
+      if(cfg){
+        seg.fields=[];
+        const walk=(o,path=[],depth=0)=>{if(depth>5||!o||typeof o!=="object"||Array.isArray(o))return;for(const [k,v] of Object.entries(o).slice(0,40)){const p=[...path,/^[a-zA-Z][a-zA-Z0-9_-]{0,35}$/.test(k)?k:"[redacted-key]"];if(v&&typeof v==="object"&&!Array.isArray(v))walk(v,p,depth+1);else seg.fields.push({field:p.join("."),type:typeof v,url:!!proxyURL(v),empty:v===""||v===null});}};
+        walk(cfg);
+      }
+      output.segments.push(seg);
     }
   }catch{}
   return output;
 }
-
 function personalBase(url,password){
   const t=proxyTemplate();if(!t||!proxyURL(url)||(!t.pw&&password))return null;
   function set(path,value){let o=t.cfg;for(const k of path.slice(0,-1))o=o[k];o[path.at(-1)]=value;}
