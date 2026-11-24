@@ -532,6 +532,20 @@ async function getEasySportsCatalogs() {
 
 // Prefer real StremVerse posters, then Highfly and EasySports artwork.
 // Preserve the selected image's own shape when merging matching events.
+function competitionLabel(meta) {
+  for (const value of [meta.competition, meta.league, meta.tournament,
+    meta.competitionName, meta.leagueName, meta.tournamentName]) {
+    const label = typeof value === "string" ? value :
+      (value && typeof value.name === "string" ? value.name : "");
+    if (label.trim() && label.trim().length <= 100) return label.trim();
+  }
+  const name = String(meta.name || meta.title || "");
+  const prefix = name.split(":")[0].trim();
+  if (name.includes(":") && /\b(?:league|liga|serie|cup|copa|championship|campionato|champions|bundesliga|eredivisie|coppa|uefa)\b/i.test(prefix) &&
+      !/\b(?:vs|versus)\b/i.test(prefix) && prefix.length <= 100) return prefix;
+  return "";
+}
+
 function pickArtwork(meta, source) {
   const valid = value => typeof value === "string" && /^https?:\/\//i.test(value.trim());
   const shapes = ["poster", "landscape", "square"];
@@ -629,6 +643,7 @@ async function getProviderEvents() {
 
   if (alreadyExists) {
     preferArtwork(alreadyExists, pickArtwork(meta, source));
+    if (!alreadyExists.competition) alreadyExists.competition = competitionLabel(meta);
     continue;
   }
 
@@ -643,6 +658,7 @@ async function getProviderEvents() {
     ...(source === "es" ? { providerType: meta.type || catalogs[index].type } : {}),
 
     name: meta.name || meta.title || "",
+    competition: competitionLabel(meta),
 
     ...pickArtwork(meta, source),
 
@@ -849,6 +865,7 @@ async function getCatalogEvents() {
         poster: event.poster,
         posterShape: event.posterShape,
         posterRank: event.posterRank,
+        competition: event.competition,
 
         description:
           event.description,
@@ -866,6 +883,7 @@ async function getCatalogEvents() {
 
 
     preferArtwork(item, event);
+    if (!item.competition && event.competition) item.competition = event.competition;
 
 
     item.providers.push({
@@ -998,9 +1016,14 @@ function rememberBounded(map, key, value, max) {
   while (map.size > max) map.delete(map.keys().next().value);
 }
 
-function artworkId(event) {
-  return crypto.createHash("sha256").update(event.key + "\n" + event.poster)
-    .digest("hex");
+function artworkId(event, version = "v2") {
+  const identity = event.key + "\n" + event.poster +
+    (version === "v2" ? "\n" + event.name + "\n" + (event.competition || "") : "");
+  return crypto.createHash("sha256").update(identity).digest("hex");
+}
+
+function artworkReference(event) {
+  return { url: event.poster, name: event.name || "", competition: event.competition || "" };
 }
 
 function artworkForMeta(event) {
@@ -1008,8 +1031,8 @@ function artworkForMeta(event) {
   // Preserve original StremVerse portrait artwork; adapt all fallback artwork.
   if (event.posterRank === 0 && event.posterShape === "poster") return event.poster;
   const id = artworkId(event);
-  rememberBounded(artworkRefs, id, event.poster, 1000);
-  return ARTWORK_ORIGIN + "/artwork/v1/" + id + ".jpg";
+  rememberBounded(artworkRefs, id, artworkReference(event), 1000);
+  return ARTWORK_ORIGIN + "/artwork/v2/" + id + ".jpg";
 }
 
 function publicArtworkIP(ip) {
@@ -1106,7 +1129,75 @@ function scheduleArtwork(task) {
   });
 }
 
-async function renderPortrait(id, source) {
+function xmlText(value) {
+  return String(value || "").replace(/[\x00-\x1f\x7f]/g, " ")
+    .replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&apos;"}[char]));
+}
+
+// Limit each line by approximate glyph width and split very long words.
+function posterLines(value, maxChars, maxLines) {
+  const words = String(value || "").replace(/\s+/g, " ").trim().slice(0, 180).split(" ").filter(Boolean);
+  const chunks = words.flatMap(word => Array.from(word).length > maxChars
+    ? Array.from(word).reduce((acc, ch, i) => {
+        if (i % maxChars === 0) acc.push("");
+        acc[acc.length - 1] += ch;
+        return acc;
+      }, [])
+    : [word]);
+  const lines = [];
+  for (const word of chunks) {
+    const last = lines[lines.length - 1];
+    if (last && Array.from(last + " " + word).length <= maxChars) lines[lines.length - 1] += " " + word;
+    else lines.push(word);
+  }
+  if (lines.length > maxLines) {
+    lines.length = maxLines;
+    lines[maxLines - 1] = Array.from(lines[maxLines - 1]).slice(0, maxChars - 1).join("") + "…";
+  }
+  return lines;
+}
+
+function portraitOverlay(source) {
+  const competition = posterLines(source.competition || "CALCIO", 24, 2);
+  const sides = getMatchSides(source.name);
+  const textLine = (value, y, fontSize, color, weight = 700) =>
+    '<text x="240" y="' + y + '" font-family="DejaVu Sans, sans-serif" font-size="' + fontSize +
+    '" font-weight="' + weight + '" fill="' + color + '" text-anchor="middle">' + xmlText(value) + '</text>';
+  const teamLines = sides.length === 2 ? sides.map(side => posterLines(side, 23, 2)) : [];
+  let footer = "";
+  if (teamLines.length === 2 && teamLines.every(lines => lines.length)) {
+    footer += teamLines[0].map((line,i) => textLine(line, 516 + i*33, 29, "#ffffff")).join("");
+    footer += textLine("VS", 592, 20, "#e7ce8f", 700);
+    footer += teamLines[1].map((line,i) => textLine(line, 635 + i*33, 29, "#ffffff")).join("");
+  } else {
+    const lines = posterLines(source.name, 23, 4);
+    footer = lines.map((line,i) => textLine(line, 552 + i*34, 29, "#ffffff")).join("");
+  }
+  return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="480" height="720" viewBox="0 0 480 720">' +
+    '<defs><linearGradient id="shade" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#090e17" stop-opacity=".88"/><stop offset=".5" stop-color="#101724" stop-opacity=".46"/><stop offset="1" stop-color="#090e17" stop-opacity=".94"/></linearGradient></defs>' +
+    '<rect width="480" height="720" fill="url(#shade)"/>' +
+    '<rect x="203" y="46" width="74" height="4" rx="2" fill="#e7ce8f"/>' +
+    competition.map((line,i) => textLine(line.toUpperCase(), 101 + i*31, 25, "#e7ce8f")).join("") +
+    '<rect x="34" y="171" width="412" height="2" rx="1" fill="#ffffff" opacity=".14"/>' +
+    '<rect x="34" y="468" width="412" height="2" rx="1" fill="#ffffff" opacity=".14"/>' +
+    footer + '</svg>');
+}
+
+async function composePortrait(input, source) {
+  const options = { limitInputPixels: 16000000 };
+  const background = await sharp(input, options).rotate()
+    .resize(480, 720, { fit: "cover" }).blur(28).flatten({background:"#161920"}).png().toBuffer();
+  const foreground = await sharp(input, options).rotate()
+    .resize(448, 274, { fit: "inside" }).flatten({background:"#161920"}).png().toBuffer({resolveWithObject:true});
+  const left = Math.floor((480 - foreground.info.width) / 2);
+  const top = Math.floor(319 - foreground.info.height / 2);
+  return sharp(background).composite([
+    { input: portraitOverlay(source), top: 0, left: 0 },
+    { input: foreground.data, top, left }
+  ]).jpeg({quality:86}).toBuffer();
+}
+
+async function renderPortrait(id, source, version) {
   const cached = artworkCache.get(id);
   if (cached && cached.expires > Date.now()) {
     rememberBounded(artworkCache, id, cached, 96);
@@ -1114,8 +1205,13 @@ async function renderPortrait(id, source) {
   }
   if (artworkInFlight.has(id)) return artworkInFlight.get(id);
   const work = scheduleArtwork(async () => {
-    const input = await downloadArtwork(source);
-    const buffer = await sharp(input, { limitInputPixels: 16000000 })
+    const input = await downloadArtwork(source.url);
+    let buffer;
+    if (version === "v2") {
+      try { buffer = await composePortrait(input, source); }
+      catch { console.warn("Decorated portrait unavailable; using plain portrait"); }
+    }
+    if (!buffer) buffer = await sharp(input, { limitInputPixels: 16000000 })
       .rotate()
       .resize(480, 720, {
         fit: "contain",
@@ -1132,8 +1228,9 @@ async function renderPortrait(id, source) {
   return work;
 }
 
-app.get("/artwork/v1/:id.jpg", async (req, res) => {
+app.get(["/artwork/v1/:id.jpg", "/artwork/v2/:id.jpg"], async (req, res) => {
   const id = req.params.id;
+  const version = req.path.startsWith("/artwork/v2/") ? "v2" : "v1";
   if (!/^[a-f0-9]{64}$/.test(id)) return res.sendStatus(404);
   try {
     let source = artworkRefs.get(id);
@@ -1141,14 +1238,14 @@ app.get("/artwork/v1/:id.jpg", async (req, res) => {
       // A cached client may request an image after a Render restart.
       const events = await getCachedCatalog();
       const event = events.find(item => item.poster &&
-        !(item.posterRank === 0 && item.posterShape === "poster") && artworkId(item) === id);
+        !(item.posterRank === 0 && item.posterShape === "poster") && artworkId(item, version) === id);
       if (event) {
-        artworkForMeta(event);
-        source = event.poster;
+        source = artworkReference(event);
+        rememberBounded(artworkRefs, id, source, 1000);
       }
     }
     if (!source) return res.sendStatus(404);
-    const buffer = await renderPortrait(id, source);
+    const buffer = await renderPortrait(id, source, version);
     res.set("Cache-Control", "public, max-age=600");
     return res.type("jpeg").send(buffer);
   } catch {
