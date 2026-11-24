@@ -1831,14 +1831,45 @@ function streamLangTokens(v){
 const STREAM_IT=new Set(["it","ita","italian","italiano","italiana","italien"]);
 const STREAM_EN=new Set(["en","eng","english","inglese","anglais"]);
 const STREAM_OTHER=new Set("es spa spanish espanol spagnolo fr fra fre french francais francese de deu ger german deutsch tedesco pt por portuguese portugues portoghese ar ara arabic arabo ru rus russian tr tur turkish nl nld dut dutch pl pol polish el ell gre greek zh zho chi chinese ja jpn japanese ko kor korean hi hin hindi ro ron rum romanian sv swe swedish da dan danish no nor norwegian cs ces cze czech sk slk slovak hu hun hungarian hr hrv croatian sr srp serbian bg bul bulgarian".split(" "));
+// A fixture title/description can contain team flags and must never identify
+// the language of a channel. Prefer fields explicitly describing that channel.
+function streamChannelFields(stream) {
+  const values=[stream.channelName,stream.channel,stream.name,stream.title];
+  return values.map(v=>typeof v==="string"?v:typeof v?.name==="string"?v.name:"")
+    .map(v=>v.trim()).filter(v=>v && !/\b(?:vs\.?|versus)\s|⚽|🏆/iu.test(v));
+}
+function countryFlagRank(value) {
+  const flags=[...new Set(String(value||"").match(/[\u{1F1E6}-\u{1F1FF}]{2}/gu)||[])];
+  if(flags.length!==1)return null;
+  const flag=flags[0];
+  if(flag==="🇮🇹")return {rank:0,label:"🇮🇹"};
+  if(flag==="🇬🇧"||flag==="🇺🇸")return {rank:1,label:flag};
+  return {rank:2,label:flag};
+}
+function cleanChannelName(value) {
+  return String(value||"").replace(/[\u{1F1E6}-\u{1F1FF}]{2}/gu,"")
+    .replace(/[\u{E0000}-\u{E007F}\uFE0F\u200D]/gu,"")
+    .replace(/\[?\b(?:proxy|mediaflow|easyproxy|mfp)\b\]?/gi," ")
+    .replace(/^[\s•|:–-]+|[\s•|:–-]+$/g,"").replace(/\s+/g," ").trim();
+}
+function displayChannel(stream) {
+  const values=streamChannelFields(stream);
+  return values.map(cleanChannelName).find(v=>v && !/^(?:stream|direct|link|easysports|highfly|stremverse|it|ita|en|eng)$/i.test(v))||"Canale non indicato";
+}
 function classifyStreamLanguage(stream){
   const explicit=[stream.audioLanguage,stream.audioLanguages,stream.language,stream.languages,
     stream.behaviorHints?.audioLanguage,stream.behaviorHints?.audioLanguages,stream.behaviorHints?.language,stream.behaviorHints?.languages].flatMap(streamLangTokens);
-  if(explicit.some(x=>STREAM_IT.has(x)))return {rank:0,label:"🇮🇹 IT"};
-  if(explicit.some(x=>STREAM_EN.has(x)))return {rank:1,label:"🇬🇧 EN"};
+  if(explicit.some(x=>STREAM_IT.has(x)))return {rank:0,label:"🇮🇹"};
+  if(explicit.some(x=>STREAM_EN.has(x)))return {rank:1,label:"🇬🇧"};
   if(explicit.some(x=>STREAM_OTHER.has(x)))return {rank:2,label:""};
-  const original=[stream.name,stream.title,stream.description,stream.channel,stream.channelName,stream.country]
-    .map(v=>typeof v==="string"?v:typeof v?.name==="string"?v.name:"").join(" ");
+  const fields=streamChannelFields(stream);
+  // The first unambiguous channel flag wins, even if the match title
+  // contains a different country. Never scan description for language.
+  for(const field of fields){
+    const flag=countryFlagRank(field);
+    if(flag)return flag;
+  }
+  const original=[...fields,typeof stream.country==="string"?stream.country:""].join(" ");
   const t=streamText(original);
   if(/🇮🇹/.test(original)||/\b(?:italiano|italiana|italian|italia|italy)\b|\b(?:dazn|sky|rai|mediaset|prime video|sportitalia)\s*(?:sport\s*)?(?:it|ita)\b|(?:^|[\s[(|])(?:it|ita)(?=$|[\s\])|])|\b(?:rai\s*(?:1|2|3|sport)|sportitalia|canale\s*5|italia\s*1|sky\s*sport\s*(?:calcio|uno|arena|24)|sky\s*sport\s*25[1-9]|dazn\s*(?:1|2)\s*it)\b/.test(t))return {rank:0,label:"🇮🇹 IT"};
   if(/🇬🇧|🇺🇸/.test(original)||/\b(?:english|inglese|uk|usa|united kingdom|united states)\b|(?:^|[\s[(|])(?:en|eng)(?=$|[\s\])|])|\b(?:tnt sports|sky sports|bbc sport|premier sports|fox soccer plus|nbc sports)\b/.test(t))return {rank:1,label:"🇬🇧 EN"};
@@ -1865,10 +1896,11 @@ function isProxyStream(stream){
 function labelStream(stream,source){
   const lang=classifyStreamLanguage(stream);
   const names={sv:"StremVerse",es:"EasySports",hf:"Highfly"};
-  const original=typeof stream.name==="string"&&stream.name.trim()?stream.name:"Stream";
+  const channel=displayChannel(stream);
   const proxy=isProxyStream(stream);
-  const labels=[lang.label,names[source]||source,proxy?"[PROXY]":""].filter(Boolean).join(" • ");
-  return {stream:{...stream,name:labels+" • "+original},rank:lang.rank,sourceRank:STREAM_SOURCE_RANK[source]??99};
+  const label=lang.label.replace(/\s+(?:IT|EN)$/,"");
+  const name=[label,proxy?"[PROXY]":"",channel].filter(Boolean).join(" ")+" • "+(names[source]||source);
+  return {stream:{...stream,name},rank:lang.rank,sourceRank:STREAM_SOURCE_RANK[source]??99};
 }
 function sortStreamEntries(entries){
   return entries.slice().sort((a,b)=>a.rank-b.rank||a.sourceRank-b.sourceRank);
