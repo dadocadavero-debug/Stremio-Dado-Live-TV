@@ -101,7 +101,7 @@ function easySportsSchema(){
         const walk=(o,path=[],depth=0)=>{if(depth>5||!o||typeof o!=="object"||Array.isArray(o))return;for(const [k,v] of Object.entries(o).slice(0,40)){const p=[...path,/^[a-zA-Z][a-zA-Z0-9_-]{0,35}$/.test(k)?k:"[redacted-key]"];if(v&&typeof v==="object"&&!Array.isArray(v))walk(v,p,depth+1);else seg.fields.push({field:p.join("."),type:typeof v,url:!!proxyURL(v),empty:v===""||v===null});}};
         walk(cfg);
       }
-      if(decoded.includes("|"))seg.pipeFields=decoded.split("|").map((v,index)=>({index,length:v.length,isURL:!!proxyURL(v),isKnownSwitch:/^(?:|true|false|0|1|on|off|yes|no|all|auto|direct|proxy|easyproxy|mediaflow|it|en|ita|eng)$/i.test(v)}));
+      if(decoded.includes("|"))seg.pipeFields=decoded.split("|").map((v,index)=>({index,length:v.length,isURL:!!proxyURL(v),isAddonOrigin:proxyURL(v)===u.origin,isKnownSwitch:/^(?:|true|false|0|1|on|off|yes|no|all|auto|direct|proxy|easyproxy|mediaflow|it|en|ita|eng)$/i.test(v)}));
       output.segments.push(seg);
     }
   }catch{}
@@ -119,7 +119,11 @@ function pipeTemplate(base=legacyEasySportsBase()){
     if(fields.length<2||fields.length>12||!proxyURL(fields[0])||fields.some(x=>/[\x00-\x1f\x7f\ufffd]/.test(x)))return null;
     // Preserve only recognized non-secret switches after the URL and password.
     // Unknown trailing fields must not be copied into another user's config.
-    if(fields.slice(2).some(x=>!/^(?:|true|false|0|1|on|off|yes|no|all|auto|direct|proxy|easyproxy|mediaflow|it|en|ita|eng)$/i.test(x)))return null;
+    if(fields.slice(2).some((x,i)=>{
+      if(/^(?:|true|false|0|1|on|off|yes|no|all|auto|direct|proxy|easyproxy|mediaflow|it|en|ita|eng)$/i.test(x))return false;
+      // Only the known public EasySports origin can be preserved as an extra URL.
+      return !(i===1&&fields.length===4&&proxyURL(x)===u.origin);
+    }))return null;
     return {origin:u.origin,fields,padded:raw.endsWith("="),standard:/[+/]/.test(raw)};
   }catch{return null;}
 }
@@ -1806,7 +1810,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.4.1",
+    "3.4.2",
 
   name:
     "Dado Live TV",
@@ -1926,7 +1930,7 @@ function configurePage(config,previousToken="") {
   const publicConfig={...config,easyProxyPassword:""};
   // Only validated ASCII preference values are inserted into the script.
   return '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dado Live TV | Configurazione</title><style>'+
-  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.4.1</p></div></header>'+
+  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.4.2</p></div></header>'+
   '<section><h2>Cataloghi nella Home</h2><div id="catalogs"></div></section>'+
   '<section><h2>EasyProxy · solo EasySports</h2><p>StremVerse e Highfly restano invariati. Inserisci un URL valido per abilitare EasySports.</p><label for="easyurl">URL EasyProxy</label><input class="field" id="easyurl" type="url" placeholder="http://IP:7860" autocomplete="off"><label for="easypass">Password API (facoltativa)</label><input class="field" id="easypass" type="password" autocomplete="new-password"><p id="proxystate"></p></section>'+
   '<section><h2>Fonti e priorità</h2><p>Attiva le fonti da visualizzare e ordinale a parità di lingua.</p><div id="sources"></div></section>'+
@@ -2511,6 +2515,14 @@ app.listen(
       `LIVE Football 3.0.0 running on port ${PORT}`
     );
     console.log("EasySports schema diagnostic:",JSON.stringify(easySportsSchema()));
+    (async()=>{try{
+      const t=pipeTemplate();
+      if(!t){console.log("EasySports compatibility check: template not recognized");return;}
+      const rebuilt=buildPipeBase(t.fields[0],t.fields[1],t);
+      if(!rebuilt){console.log("EasySports compatibility check: reconstruction failed");return;}
+      const m=await getJsonRaw(rebuilt+"/manifest.json",6000);
+      console.log("EasySports compatibility check:",JSON.stringify({manifestValid:Array.isArray(m.catalogs),catalogCount:Array.isArray(m.catalogs)?m.catalogs.length:0}));
+    }catch{console.log("EasySports compatibility check: upstream request failed");}})();
     // Prepare the catalog as soon as the process starts, without blocking listen.
     getCachedCatalog().catch(()=>console.warn("Initial catalog refresh unavailable"));
   }
