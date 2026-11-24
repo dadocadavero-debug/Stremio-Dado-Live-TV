@@ -77,6 +77,34 @@ function proxyTemplate(){
     return matches.length===1?matches[0]:null;
   }catch{return null;}
 }
+function easySportsSchema(){
+  const output={legacyConfigured:!!legacyEasySportsBase(),segments:[],recognized:!!proxyTemplate()};
+  try{
+    const u=new URL(legacyEasySportsBase());
+    const parts=u.pathname.split("/").filter(Boolean);
+    for(let i=0;i<parts.length;i++){
+      const segment={index:i,length:parts[i].length,fields:[]};
+      // Record only fixed, safe key names and types, never field values or encoded segments.
+      try{
+        const raw=decodeURIComponent(parts[i]);
+        let cfg;try{cfg=JSON.parse(Buffer.from(raw,"base64url").toString("utf8"));}catch{cfg=JSON.parse(raw);}
+        const walk=(o,path=[],depth=0)=>{
+          if(depth>5||!o||typeof o!=="object"||Array.isArray(o))return;
+          for(const [k,v] of Object.entries(o).slice(0,40)){
+            const safe=/^[a-zA-Z][a-zA-Z0-9_-]{0,35}$/.test(k)?k:"[redacted-key]";
+            const p=[...path,safe];
+            if(v&&typeof v==="object"&&!Array.isArray(v))walk(v,p,depth+1);
+            else segment.fields.push({field:p.join("."),type:Array.isArray(v)?"array":v===null?"null":typeof v,empty:v===""||v===null,url:!!proxyURL(v),httpPrefix:typeof v==="string"&&/^https?:\/\//i.test(v)});
+          }
+        };
+        if(cfg&&typeof cfg==="object"){segment.format="json";walk(cfg);}
+      }catch{segment.format="unrecognized";}
+      output.segments.push(segment);
+    }
+  }catch{}
+  return output;
+}
+
 function personalBase(url,password){
   const t=proxyTemplate();if(!t||!proxyURL(url)||(!t.pw&&password))return null;
   function set(path,value){let o=t.cfg;for(const k of path.slice(0,-1))o=o[k];o[path.at(-1)]=value;}
@@ -1903,7 +1931,7 @@ app.post("/configure/save",async(req,res)=>{
  }
  try{res.json({url:"https://dado-live-tv.onrender.com/c/"+seal(config)+"/manifest.json"});}catch{res.status(503).json({error:"Salvataggio protetto non disponibile"});}
 });
-app.get("/debug/easyproxy-config",(req,res)=>{const t=proxyTemplate();res.set("Cache-Control","no-store");res.json({legacyConfigured:!!legacyEasySportsBase(),templateRecognized:!!t,passwordSupported:!!t?.pw,encryptionReady:!!encryptionKey()});});
+app.get("/debug/easyproxy-config",(req,res)=>{const t=proxyTemplate();res.set("Cache-Control","no-store");res.json({legacyConfigured:!!legacyEasySportsBase(),templateRecognized:!!t,passwordSupported:!!t?.pw,encryptionReady:!!encryptionKey(),schema:easySportsSchema()});});
 
 /* =========================================================
    LOGO PERSONALIZZATO DADO LIVE TV
@@ -2453,6 +2481,7 @@ app.listen(
     console.log(
       `LIVE Football 3.0.0 running on port ${PORT}`
     );
+    console.log("EasySports schema diagnostic:",JSON.stringify(easySportsSchema()));
     // Prepare the catalog as soon as the process starts, without blocking listen.
     getCachedCatalog().catch(()=>console.warn("Initial catalog refresh unavailable"));
   }
