@@ -29,7 +29,8 @@ let preferredHighflyBase = HIGHFLY;
 
 // Keep the configured manifest (which may include proxy credentials) out of Git.
 const EASYSPORTS_MANIFEST_URL = process.env.EASYSPORTS_MANIFEST_URL || "";
-let easySportsCatalogCache = { expires: 0, catalogs: [] };
+let easySportsCatalogCache = { expires: 0, staleUntil: 0, catalogs: [] };
+let easySportsManifestInFlight = null;
 
 function easySportsBase() {
   if (!EASYSPORTS_MANIFEST_URL) return null;
@@ -485,7 +486,7 @@ function easySportsFootballMeta(meta, catalog) {
 
 // Discover the catalog IDs and types from the configured Stremio manifest.
 // The existing event filter remains responsible for selecting the wanted teams.
-async function getEasySportsCatalogs() {
+async function discoverEasySportsCatalogs() {
   const base = easySportsBase();
   if (!base) return [];
   if (easySportsCatalogCache.expires > Date.now()) {
@@ -519,15 +520,24 @@ async function getEasySportsCatalogs() {
     const selected = footballCatalogs.length ? footballCatalogs :
       (preferred.length ? preferred : catalogs);
     easySportsCatalogCache = {
-      expires: Date.now() + 5 * 60 * 1000,
+      expires: Date.now() + 30 * 60 * 1000,
+      staleUntil: Date.now() + 6 * 60 * 60 * 1000,
       catalogs: selected
     };
     return selected;
   } catch {
     // Never log the configured manifest URL or its credentials.
     console.warn("EasySports manifest unavailable");
-    return [];
+    const previous=easySportsCatalogCache.staleUntil>Date.now()?easySportsCatalogCache.catalogs:[];
+    easySportsCatalogCache={...easySportsCatalogCache,expires:Date.now()+30*1000,catalogs:previous};
+    return previous;
   }
+}
+
+function getEasySportsCatalogs() {
+  if (easySportsManifestInFlight) return easySportsManifestInFlight;
+  easySportsManifestInFlight=discoverEasySportsCatalogs().finally(()=>{easySportsManifestInFlight=null;});
+  return easySportsManifestInFlight;
 }
 
 // Prefer real StremVerse posters, then Highfly and EasySports artwork.
@@ -700,18 +710,57 @@ function timeVisible(t,now=Date.now()) {
   return !["unknown","finished","expired","past-day"].includes(timeDecision(t,now));
 }
 
+// Catalog requests share a short per-endpoint cache. A failed provider can reuse
+// its own last successful catalog briefly without delaying unrelated providers.
+const providerCatalogCache=new Map();
+const providerCatalogInFlight=new Map();
+const catalogPerformance={refreshes:0,lastRefreshMs:null,lastCounts:{},sources:{},artwork:{hits:0,misses:0,shared:0,completed:0,failed:0,lastMs:null}};
+function providerCatalog(item) {
+  const cached=providerCatalogCache.get(item.url), now=Date.now();
+  if(cached && cached.expires>now)return Promise.resolve(cached.value);
+  if(providerCatalogInFlight.has(item.url))return providerCatalogInFlight.get(item.url);
+  const started=Date.now();
+  const stats=catalogPerformance.sources[item.source] ||= {requests:0,failures:0,lastMs:null,staleHits:0};
+  stats.requests++;
+  const work=Promise.resolve().then(()=>item.source==="hf"?getJson(item.url):getJsonRaw(item.url,6500))
+    .then(value=>{
+      if(!Array.isArray(value?.metas))throw new Error("Invalid provider catalog");
+      providerCatalogCache.delete(item.url);
+      providerCatalogCache.set(item.url,{value,expires:Date.now()+60*1000,staleUntil:Date.now()+20*60*1000});
+      while(providerCatalogCache.size>48)providerCatalogCache.delete(providerCatalogCache.keys().next().value);
+      return value;
+    }).catch(error=>{
+      stats.failures++;
+      if(cached&&cached.staleUntil>Date.now()){
+        stats.staleHits++;
+        return cached.value;
+      }
+      throw error;
+    }).finally(()=>{
+      stats.lastMs=Date.now()-started;
+      providerCatalogInFlight.delete(item.url);
+    });
+  providerCatalogInFlight.set(item.url,work);
+  return work;
+}
+
+async function collectCatalogResponses(existing, discover, fetchCatalog) {
+  const first=Promise.allSettled(existing.map(fetchCatalog));
+  const second=Promise.resolve().then(discover).then(async catalogs=>({
+    catalogs, results:await Promise.allSettled(catalogs.map(fetchCatalog))
+  }));
+  const [a,b]=await Promise.all([first,second]);
+  return {catalogs:[...existing,...b.catalogs],results:[...a,...b.results]};
+}
+
 async function getProviderEvents() {
 
-  // Start the existing providers immediately, even while discovering EasySports.
-  const existingResults = Promise.allSettled(
-    PROVIDER_CATALOGS.map(item => getJson(item.url))
-  );
-  const easyCatalogs = await getEasySportsCatalogs();
-  const catalogs = [...PROVIDER_CATALOGS, ...easyCatalogs];
-  const results = [
-    ...await existingResults,
-    ...await Promise.allSettled(easyCatalogs.map(item => getJsonRaw(item.url, 6000)))
-  ];
+  const started=Date.now();
+  // EasySports catalog requests begin as soon as discovery finishes, not after
+  // StremVerse and Highfly have returned. Keep deterministic source order.
+  const {catalogs,results}=await collectCatalogResponses(PROVIDER_CATALOGS,getEasySportsCatalogs,providerCatalog);
+  catalogPerformance.refreshes++;
+  catalogPerformance.lastRefreshMs=Date.now()-started;
 
 
   // An outage in every provider must not replace an existing catalog with an empty one.
@@ -721,7 +770,8 @@ async function getProviderEvents() {
 
 
   const events = [];
-
+  const eventIndex=new Map();
+  const counts={};
 
   results.forEach(
     (result, index) => {
@@ -742,7 +792,7 @@ async function getProviderEvents() {
 
       const source =
         catalogs[index].source;
-
+      counts[source]=(counts[source]||0)+result.value.metas.length;
 
       for (
   const meta of
@@ -761,11 +811,7 @@ async function getProviderEvents() {
     `${source}:${meta.id}`;
 
 
-  const alreadyExists =
-    events.find(
-      e =>
-        `${e.source}:${e.providerId}` === providerKey
-    );
+  const alreadyExists=eventIndex.get(providerKey);
 
 
   if (alreadyExists) {
@@ -777,7 +823,7 @@ async function getProviderEvents() {
   }
 
 
-  events.push({
+  const event={
 
     source,
 
@@ -799,12 +845,15 @@ async function getProviderEvents() {
     releaseInfo:
       meta.releaseInfo ||
       ""
-  });
+  };
+  events.push(event);
+  eventIndex.set(providerKey,event);
 }
     }
   );
 
 
+  catalogPerformance.lastCounts=counts;
   return events;
 }
 
@@ -1262,7 +1311,7 @@ async function downloadArtwork(value, redirects = 0) {
 }
 
 function drainArtworkQueue() {
-  while (artworkActive < 3 && artworkQueue.length) {
+  while (artworkActive < 5 && artworkQueue.length) {
     const { task, resolve, reject } = artworkQueue.shift();
     artworkActive++;
     Promise.resolve().then(task).then(resolve, reject).finally(() => {
@@ -1450,7 +1499,7 @@ function portraitOverlay(source, hasLogo = false, version = "v6") {
     footer+'</svg>');
 }
 
-async function composePortrait(input, source, version) {
+async function composePortrait(input, source, version, logoPromise) {
   const options = { limitInputPixels: 16000000 };
   const background = await sharp(input, options).rotate()
     .resize(480, 720, { fit: "cover" }).blur(28).flatten({background:"#161920"}).png().toBuffer();
@@ -1458,7 +1507,7 @@ async function composePortrait(input, source, version) {
     .resize(448, 274, { fit: "inside" }).flatten({background:"#161920"}).png().toBuffer({resolveWithObject:true});
   const left = Math.floor((480 - foreground.info.width) / 2);
   const top = Math.floor(319 - foreground.info.height / 2);
-  const logo=["v4","v5","v6"].includes(version)?await loadCompetitionLogo(competitionLogoId(source.competition)):null;
+  const logo=await logoPromise;
   return sharp(background).composite([
     { input: portraitOverlay(source,!!logo,version), top: 0, left: 0 },
     { input: foreground.data, top, left },
@@ -1469,15 +1518,19 @@ async function composePortrait(input, source, version) {
 async function renderPortrait(id, source, version) {
   const cached = artworkCache.get(id);
   if (cached && cached.expires > Date.now()) {
+    catalogPerformance.artwork.hits++;
     rememberBounded(artworkCache, id, cached, 96);
     return cached.buffer;
   }
-  if (artworkInFlight.has(id)) return artworkInFlight.get(id);
+  if (artworkInFlight.has(id)) {catalogPerformance.artwork.shared++;return artworkInFlight.get(id);}
+  catalogPerformance.artwork.misses++;
+  const started=Date.now();
   const work = scheduleArtwork(async () => {
+    const logoPromise=["v4","v5","v6"].includes(version)?loadCompetitionLogo(competitionLogoId(source.competition)):Promise.resolve(null);
     const input = await downloadArtwork(source.url);
     let buffer;
     if (["v2","v3","v4","v5","v6"].includes(version)) {
-      try { buffer = await composePortrait(input, source, version); }
+      try { buffer = await composePortrait(input, source, version, logoPromise); }
       catch { console.warn("Decorated portrait unavailable; using plain portrait"); }
     }
     if (!buffer) buffer = await sharp(input, { limitInputPixels: 16000000 })
@@ -1490,9 +1543,13 @@ async function renderPortrait(id, source, version) {
       .flatten({ background: "#161920" })
       .jpeg({ quality: 86 })
       .toBuffer();
-    rememberBounded(artworkCache, id, { buffer, expires: Date.now() + 30 * 60 * 1000 }, 96);
+    rememberBounded(artworkCache, id, { buffer, expires: Date.now() + 2 * 60 * 60 * 1000 }, 96);
+    catalogPerformance.artwork.completed++;
     return buffer;
-  }).finally(() => artworkInFlight.delete(id));
+  }).catch(error=>{catalogPerformance.artwork.failed++;throw error;}).finally(() => {
+    catalogPerformance.artwork.lastMs=Date.now()-started;
+    artworkInFlight.delete(id);
+  });
   artworkInFlight.set(id, work);
   return work;
 }
@@ -1515,7 +1572,7 @@ app.get(["/artwork/v1/:id.jpg", "/artwork/v2/:id.jpg", "/artwork/v3/:id.jpg", "/
     }
     if (!source) return res.sendStatus(404);
     const buffer = await renderPortrait(id, source, version);
-    res.set("Cache-Control", "public, max-age=600");
+    res.set("Cache-Control", "public, max-age=1800");
     return res.type("jpeg").send(buffer);
   } catch {
     // Never expose upstream URLs or credentials through errors or logs.
@@ -2064,6 +2121,11 @@ app.get(
    START
 ========================================================= */
 
+app.get("/debug/catalog-performance",(req,res)=>{
+  res.set("Cache-Control","no-store");
+  res.json({...catalogPerformance,cache:{events:catalogCache.events.length,validUntil:catalogCache.expires?new Date(catalogCache.expires).toISOString():null,refreshing:!!catalogRefreshPromise,providerEntries:providerCatalogCache.size,artworkEntries:artworkCache.size,artworkActive,artworkQueued:artworkQueue.length}});
+});
+
 app.listen(
   PORT,
   () => {
@@ -2071,5 +2133,7 @@ app.listen(
     console.log(
       `LIVE Football 3.0.0 running on port ${PORT}`
     );
+    // Prepare the catalog as soon as the process starts, without blocking listen.
+    getCachedCatalog().catch(()=>console.warn("Initial catalog refresh unavailable"));
   }
 );
