@@ -78,7 +78,7 @@ function proxyTemplate(){
   }catch{return null;}
 }
 function easySportsSchema(){
-  const output={legacyConfigured:!!legacyEasySportsBase(),segments:[],recognized:!!proxyTemplate()};
+  const output={legacyConfigured:!!legacyEasySportsBase(),segments:[],recognized:!!(proxyTemplate()||pipeTemplate())};
   try{
     const u=new URL(legacyEasySportsBase());
     for(const part of u.pathname.split("/").filter(Boolean)){
@@ -101,12 +101,40 @@ function easySportsSchema(){
         const walk=(o,path=[],depth=0)=>{if(depth>5||!o||typeof o!=="object"||Array.isArray(o))return;for(const [k,v] of Object.entries(o).slice(0,40)){const p=[...path,/^[a-zA-Z][a-zA-Z0-9_-]{0,35}$/.test(k)?k:"[redacted-key]"];if(v&&typeof v==="object"&&!Array.isArray(v))walk(v,p,depth+1);else seg.fields.push({field:p.join("."),type:typeof v,url:!!proxyURL(v),empty:v===""||v===null});}};
         walk(cfg);
       }
+      if(decoded.includes("|"))seg.pipeFields=decoded.split("|").map((v,index)=>({index,length:v.length,isURL:!!proxyURL(v),isKnownSwitch:/^(?:|true|false|0|1|on|off|yes|no|all|auto|direct|proxy|easyproxy|mediaflow|it|en|ita|eng)$/i.test(v)}));
       output.segments.push(seg);
     }
   }catch{}
   return output;
 }
+// EasySports also uses Base64-encoded pipe-delimited settings.
+function pipeTemplate(base=legacyEasySportsBase()){
+  try{
+    const u=new URL(base),parts=u.pathname.split("/").filter(Boolean);
+    if(parts.length!==1)return null;
+    const raw=decodeURIComponent(parts[0]);
+    if(!/^[A-Za-z0-9+/_=-]+$/.test(raw))return null;
+    const decoded=Buffer.from(raw,"base64url").toString("utf8");
+    const fields=decoded.split("|");
+    if(fields.length<2||fields.length>12||!proxyURL(fields[0])||fields.some(x=>/[\x00-\x1f\x7f\ufffd]/.test(x)))return null;
+    // Preserve only recognized non-secret switches after the URL and password.
+    // Unknown trailing fields must not be copied into another user's config.
+    if(fields.slice(2).some(x=>!/^(?:|true|false|0|1|on|off|yes|no|all|auto|direct|proxy|easyproxy|mediaflow|it|en|ita|eng)$/i.test(x)))return null;
+    return {origin:u.origin,fields,padded:raw.endsWith("="),standard:/[+/]/.test(raw)};
+  }catch{return null;}
+}
+function buildPipeBase(url,password,t=pipeTemplate()){
+  const normalized=proxyURL(url);
+  if(!t||!normalized||typeof password!=="string"||/[|\x00-\x1f\x7f]/.test(password))return null;
+  const fields=[normalized,password,...t.fields.slice(2)];
+  let encoded=Buffer.from(fields.join("|"),"utf8").toString(t.standard?"base64":"base64url");
+  if(t.padded)encoded+="=".repeat((4-encoded.length%4)%4);
+  else encoded=encoded.replace(/=+$/,"");
+  return t.origin+"/"+encodeURIComponent(encoded);
+}
+
 function personalBase(url,password){
+  const pipe=pipeTemplate();if(pipe)return buildPipeBase(url,password||"",pipe);
   const t=proxyTemplate();if(!t||!proxyURL(url)||(!t.pw&&password))return null;
   function set(path,value){let o=t.cfg;for(const k of path.slice(0,-1))o=o[k];o[path.at(-1)]=value;}
   set(t.url,proxyURL(url));if(t.pw)set(t.pw,password||"");
@@ -1778,7 +1806,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.4.0",
+    "3.4.1",
 
   name:
     "Dado Live TV",
@@ -1898,7 +1926,7 @@ function configurePage(config,previousToken="") {
   const publicConfig={...config,easyProxyPassword:""};
   // Only validated ASCII preference values are inserted into the script.
   return '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dado Live TV | Configurazione</title><style>'+
-  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.4.0</p></div></header>'+
+  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.4.1</p></div></header>'+
   '<section><h2>Cataloghi nella Home</h2><div id="catalogs"></div></section>'+
   '<section><h2>EasyProxy · solo EasySports</h2><p>StremVerse e Highfly restano invariati. Inserisci un URL valido per abilitare EasySports.</p><label for="easyurl">URL EasyProxy</label><input class="field" id="easyurl" type="url" placeholder="http://IP:7860" autocomplete="off"><label for="easypass">Password API (facoltativa)</label><input class="field" id="easypass" type="password" autocomplete="new-password"><p id="proxystate"></p></section>'+
   '<section><h2>Fonti e priorità</h2><p>Attiva le fonti da visualizzare e ordinale a parità di lingua.</p><div id="sources"></div></section>'+
@@ -1932,7 +1960,7 @@ app.post("/configure/save",async(req,res)=>{
  }
  try{res.json({url:"https://dado-live-tv.onrender.com/c/"+seal(config)+"/manifest.json"});}catch{res.status(503).json({error:"Salvataggio protetto non disponibile"});}
 });
-app.get("/debug/easyproxy-config",(req,res)=>{const t=proxyTemplate();res.set("Cache-Control","no-store");res.json({legacyConfigured:!!legacyEasySportsBase(),templateRecognized:!!t,passwordSupported:!!t?.pw,encryptionReady:!!encryptionKey(),schema:easySportsSchema()});});
+app.get("/debug/easyproxy-config",(req,res)=>{const t=proxyTemplate();res.set("Cache-Control","no-store");res.json({legacyConfigured:!!legacyEasySportsBase(),templateRecognized:!!(t||pipeTemplate()),passwordSupported:!!(t?.pw||pipeTemplate()),encryptionReady:!!encryptionKey(),schema:easySportsSchema()});});
 
 /* =========================================================
    LOGO PERSONALIZZATO DADO LIVE TV
