@@ -521,6 +521,35 @@ async function getEasySportsCatalogs() {
   }
 }
 
+// Prefer real StremVerse posters, then Highfly and EasySports artwork.
+// Preserve the selected image's own shape when merging matching events.
+function pickArtwork(meta, source) {
+  const valid = value => typeof value === "string" && /^https?:\/\//i.test(value.trim());
+  const shapes = ["poster", "landscape", "square"];
+  const shape = shapes.includes(meta.posterShape) ? meta.posterShape : null;
+  const priority = { sv: 0, hf: 1, es: 2 }[source] ?? 3;
+  if (valid(meta.poster)) return {
+    poster: meta.poster.trim(),
+    posterShape: shape || (source === "sv" ? "poster" : "landscape"),
+    posterRank: priority
+  };
+  if (valid(meta.background)) return {
+    poster: meta.background.trim(), posterShape: "landscape", posterRank: 10 + priority
+  };
+  if (valid(meta.logo)) return {
+    poster: meta.logo.trim(), posterShape: "square", posterRank: 20 + priority
+  };
+  return { poster: null, posterShape: null, posterRank: Infinity };
+}
+
+function preferArtwork(target, candidate) {
+  if (candidate.poster && (!target.poster || candidate.posterRank < target.posterRank)) {
+    target.poster = candidate.poster;
+    target.posterShape = candidate.posterShape;
+    target.posterRank = candidate.posterRank;
+  }
+}
+
 async function getProviderEvents() {
 
   // Start the existing providers immediately, even while discovering EasySports.
@@ -583,13 +612,14 @@ async function getProviderEvents() {
 
 
   const alreadyExists =
-    events.some(
+    events.find(
       e =>
         `${e.source}:${e.providerId}` === providerKey
     );
 
 
   if (alreadyExists) {
+    preferArtwork(alreadyExists, pickArtwork(meta, source));
     continue;
   }
 
@@ -605,11 +635,7 @@ async function getProviderEvents() {
 
     name: meta.name || meta.title || "",
 
-    poster:
-      meta.poster ||
-      meta.background ||
-      meta.logo ||
-      null,
+    ...pickArtwork(meta, source),
 
     description:
       meta.description ||
@@ -811,8 +837,9 @@ async function getCatalogEvents() {
         name:
           event.name,
 
-        poster:
-          event.poster,
+        poster: event.poster,
+        posterShape: event.posterShape,
+        posterRank: event.posterRank,
 
         description:
           event.description,
@@ -829,19 +856,7 @@ async function getCatalogEvents() {
       map.get(key);
 
 
-    /*
-      Se la prima fonte non aveva poster,
-      utilizziamo quello dell'altra.
-    */
-
-    if (
-      !item.poster &&
-      event.poster
-    ) {
-
-      item.poster =
-        event.poster;
-    }
+    preferArtwork(item, event);
 
 
     item.providers.push({
@@ -977,8 +992,7 @@ function eventToMeta(event) {
       event.poster ||
       undefined,
 
-    // posterShape:
-//   "landscape",
+    posterShape: event.posterShape || "poster",
 
     description:
       event.description ||
