@@ -1817,6 +1817,63 @@ app.get(
    STREAM DAL PROVIDER ORIGINALE
 ========================================================= */
 
+// Language ranking uses provider metadata or recognizable channel labels,
+// never a media probe. An inferred language is not a guarantee of audio.
+const STREAM_SOURCE_RANK={sv:0,es:1,hf:2};
+function streamText(v){
+  return typeof v==="string"?v.normalize("NFKD").replace(/[\u0300-\u036f]/g,"").toLowerCase():"";
+}
+function streamLangTokens(v){
+  if(Array.isArray(v))return v.flatMap(streamLangTokens);
+  if(v&&typeof v==="object")return [v.code,v.language,v.name].flatMap(streamLangTokens);
+  return streamText(v).split(/[,;|/+\s]+/).map(x=>x.split("-")[0]).filter(Boolean);
+}
+const STREAM_IT=new Set(["it","ita","italian","italiano","italiana","italien"]);
+const STREAM_EN=new Set(["en","eng","english","inglese","anglais"]);
+const STREAM_OTHER=new Set("es spa spanish espanol spagnolo fr fra fre french francais francese de deu ger german deutsch tedesco pt por portuguese portugues portoghese ar ara arabic arabo ru rus russian tr tur turkish nl nld dut dutch pl pol polish el ell gre greek zh zho chi chinese ja jpn japanese ko kor korean hi hin hindi ro ron rum romanian sv swe swedish da dan danish no nor norwegian cs ces cze czech sk slk slovak hu hun hungarian hr hrv croatian sr srp serbian bg bul bulgarian".split(" "));
+function classifyStreamLanguage(stream){
+  const explicit=[stream.audioLanguage,stream.audioLanguages,stream.language,stream.languages,
+    stream.behaviorHints?.audioLanguage,stream.behaviorHints?.audioLanguages,stream.behaviorHints?.language,stream.behaviorHints?.languages].flatMap(streamLangTokens);
+  if(explicit.some(x=>STREAM_IT.has(x)))return {rank:0,label:"🇮🇹 IT"};
+  if(explicit.some(x=>STREAM_EN.has(x)))return {rank:1,label:"🇬🇧 EN"};
+  if(explicit.some(x=>STREAM_OTHER.has(x)))return {rank:2,label:""};
+  const original=[stream.name,stream.title,stream.description,stream.channel,stream.channelName,stream.country]
+    .map(v=>typeof v==="string"?v:typeof v?.name==="string"?v.name:"").join(" ");
+  const t=streamText(original);
+  if(/🇮🇹/.test(original)||/\b(?:italiano|italiana|italian|italia|italy)\b|\b(?:dazn|sky|rai|mediaset|prime video|sportitalia)\s*(?:sport\s*)?(?:it|ita)\b|(?:^|[\s[(|])(?:it|ita)(?=$|[\s\])|])|\b(?:rai\s*(?:1|2|3|sport)|sportitalia|canale\s*5|italia\s*1|sky\s*sport\s*(?:calcio|uno|arena|24)|sky\s*sport\s*25[1-9]|dazn\s*(?:1|2)\s*it)\b/.test(t))return {rank:0,label:"🇮🇹 IT"};
+  if(/🇬🇧|🇺🇸/.test(original)||/\b(?:english|inglese|uk|usa|united kingdom|united states)\b|(?:^|[\s[(|])(?:en|eng)(?=$|[\s\])|])|\b(?:tnt sports|sky sports|bbc sport|premier sports|fox soccer plus|nbc sports)\b/.test(t))return {rank:1,label:"🇬🇧 EN"};
+  if(/[\u{1F1E6}-\u{1F1FF}]{2}/u.test(original)||/\b(?:french|france|francais|francese|german|deutsch|germany|tedesco|spanish|espana|spain|espanol|spagnolo|portuguese|portugal|brasil|brazil|arabic|arabo|turkish|turco|turkey|poland|polish|romania|romanian|serbia|croatia|greece|malaysia|argentina|mexico|denmark|bulgaria|cyprus|israel|netherlands|hungary|slovakia|czech|switzerland)\b/.test(t))return {rank:2,label:""};
+  return {rank:3,label:""};
+}
+function isProxyStream(stream){
+  if(stream.proxy===true||stream.isProxy===true||stream.behaviorHints?.proxy===true||stream.behaviorHints?.isProxy===true)return true;
+  const text=streamText([stream.name,stream.title,stream.description].filter(v=>typeof v==="string").join(" "));
+  if(!/\b(?:no proxy|without proxy|senza proxy|non proxy|proxy free)\b/.test(text)&&/\b(?:proxy|mediaflow|easyproxy|mfp)\b/.test(text))return true;
+  for(const value of [stream.url,stream.externalUrl]){
+    if(typeof value!=="string")continue;
+    // Inspect only the authority and path. No network requests or URL changes.
+    const m=value.match(/^https?:\/\/([^/?#]+)([^?#]*)(?:\?([^#]*))?/i);
+    if(!m)continue;
+    const authority=m[1].toLowerCase(),path=m[2],query=m[3]||"";
+    if(/(?:^|[.-])(?:mediaflow|easyproxy|proxy)(?:[.:-]|$)/i.test(authority)||
+       /(?:^|\/)(?:proxy|mediaflow|easyproxy)(?:\/|$)/i.test(path)||
+       (/\/(?:hls|stream)\/manifest\.m3u8$/i.test(path)&&/(?:^|&)(?:d|api_password)=/.test(query))||
+       /^(?:localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+):7860$/i.test(authority))return true;
+  }
+  return false;
+}
+function labelStream(stream,source){
+  const lang=classifyStreamLanguage(stream);
+  const names={sv:"StremVerse",es:"EasySports",hf:"Highfly"};
+  const original=typeof stream.name==="string"&&stream.name.trim()?stream.name:"Stream";
+  const proxy=isProxyStream(stream);
+  const labels=[lang.label,names[source]||source,proxy?"[PROXY]":""].filter(Boolean).join(" • ");
+  return {stream:{...stream,name:labels+" • "+original},rank:lang.rank,sourceRank:STREAM_SOURCE_RANK[source]??99};
+}
+function sortStreamEntries(entries){
+  return entries.slice().sort((a,b)=>a.rank-b.rank||a.sourceRank-b.sourceRank);
+}
+
 async function getStreams(provider) {
   let url;
 
@@ -1833,12 +1890,7 @@ async function getStreams(provider) {
   }
 
   const data = provider.source === "es" ? await getJsonRaw(url, 6000) : await getJson(url);
-  const names = { sv: "StremVerse", hf: "Highfly", es: "EasySports" };
-
-  return (data.streams || []).map(stream => ({
-    ...stream,
-    name: names[provider.source] + " • " + (stream.name || "Stream")
-  }));
+  return (data.streams || []).map(stream => labelStream(stream,provider.source));
 }
 
 
@@ -1892,11 +1944,11 @@ async function collectStreams(event) {
     })
   );
 
-  const streams = results.flatMap(result =>
+  const streams = sortStreamEntries(results.flatMap(result =>
     result.status === "fulfilled" ? result.value : []
-  );
+  )).map(entry=>entry.stream);
 
-  // Deduplicate without changing source order, headers or playback hints.
+  // Deduplicate after language/source ordering, preserving playback fields.
   const unique = [];
   const seen = new Set();
   for (const stream of streams) {
