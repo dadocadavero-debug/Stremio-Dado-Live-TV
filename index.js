@@ -11,6 +11,13 @@ sharp.cache({ memory: 16, files: 0, items: 32 });
 
 const app = express();
 app.use(express.json());
+app.use((req,res,next)=>{
+  res.set("Access-Control-Allow-Origin","*");
+  res.set("Access-Control-Allow-Methods","GET, HEAD, OPTIONS");
+  res.set("Access-Control-Allow-Headers","Content-Type");
+  if(req.method==="OPTIONS")return res.sendStatus(204);
+  next();
+});
 
 const PORT = process.env.PORT || 3000;
 
@@ -1709,7 +1716,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.2.1",
+    "3.3.0",
 
   name:
     "Dado Live TV",
@@ -1744,6 +1751,7 @@ const manifest = {
     {type:"tv",id:"live_sport_v1",name:"🔴 LIVE Sport"}
   ],
 
+  behaviorHints: {configurable:true,configurationRequired:false},
   idPrefixes: [
     "live_test:"
   ]
@@ -1763,6 +1771,80 @@ app.get(
 );
 
 
+
+const DEFAULT_SETTINGS=Object.freeze({
+  catalogs:["football","sport"],sources:["sv","es","hf"],languages:[0,1,2,3],proxy:"all"
+});
+function safeSettings(value) {
+  const v=value&&typeof value==="object"?value:{};
+  const unique=(items,allowed)=>Array.isArray(items)?[...new Set(items.filter(x=>allowed.includes(x)))]:allowed.slice();
+  const catalogs=unique(v.catalogs,DEFAULT_SETTINGS.catalogs);
+  const sources=unique(v.sources,DEFAULT_SETTINGS.sources);
+  const languages=unique(v.languages,DEFAULT_SETTINGS.languages);
+  return {catalogs:catalogs.length?catalogs:DEFAULT_SETTINGS.catalogs.slice(),
+    sources:sources.length?sources:DEFAULT_SETTINGS.sources.slice(),
+    languages:[...languages,...DEFAULT_SETTINGS.languages.filter(x=>!languages.includes(x))],
+    proxy:["all","direct","proxy"].includes(v.proxy)?v.proxy:"all"};
+}
+function settingsFromToken(token) {
+  if(!token)return safeSettings();
+  if(typeof token!=="string"||token.length>1024||!/^[A-Za-z0-9_-]+$/.test(token))return null;
+  try{return safeSettings(JSON.parse(Buffer.from(token,"base64url").toString("utf8")));}catch{return null;}
+}
+function requestSettings(req,res) {
+  const config=settingsFromToken(req.params.settings);
+  if(!config)res.status(400).json({error:"Invalid settings"});
+  return config;
+}
+function eventAllowed(event,config) {
+  const catalog=event.sport==="tennis"||event.sport==="motors"?"sport":"football";
+  return config.catalogs.includes(catalog)&&event.providers.some(p=>config.sources.includes(p.source));
+}
+function configuredManifest(config) {
+  return {...manifest,catalogs:manifest.catalogs.filter(c=>config.catalogs.includes(c.id==="live_football_v5"?"football":"sport"))};
+}
+function configuredStreamList(entries,config) {
+  const sourceId=entry=>Object.keys(STREAM_SOURCE_RANK).find(k=>STREAM_SOURCE_RANK[k]===entry.sourceRank);
+  const sorted=entries.filter(entry=>config.sources.includes(sourceId(entry))&&
+    (config.proxy==="all"||(config.proxy==="proxy")===entry.proxy))
+    .sort((a,b)=>config.languages.indexOf(a.rank)-config.languages.indexOf(b.rank)||
+      config.sources.indexOf(sourceId(a))-config.sources.indexOf(sourceId(b)));
+  const seen=new Set(),unique=[];
+  for(const {stream} of sorted){
+    const key=stream.url||stream.externalUrl||stream.ytId||JSON.stringify(stream);
+    if(!seen.has(key)){seen.add(key);unique.push(stream);}
+  }
+  return unique;
+}
+app.get("/c/:settings/manifest.json",(req,res)=>{
+  const config=requestSettings(req,res);
+  if(config)res.json(configuredManifest(config));
+});
+
+
+function configurePage(config) {
+  // Only validated ASCII preference values are inserted into the script.
+  return '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dado Live TV | Configurazione</title><style>'+
+  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.3.0</p></div></header>'+
+  '<section><h2>Cataloghi nella Home</h2><div id="catalogs"></div></section>'+
+  '<section><h2>Fonti e priorità</h2><p>Attiva le fonti da visualizzare e ordinale a parità di lingua.</p><div id="sources"></div></section>'+
+  '<section><h2>Priorità delle lingue</h2><p>La prima lingua viene mostrata per prima nei risultati.</p><div id="languages"></div></section>'+
+  '<section><h2>Proxy</h2><select id="proxy" aria-label="Filtro proxy"><option value="all">Tutti i collegamenti</option><option value="direct">Senza indicazione PROXY</option><option value="proxy">Solo PROXY riconosciuti</option></select><p>Il riconoscimento dipende dai metadati. Gli eventi terminati restano esclusi.</p></section>'+
+  '<div class="actions"><a class="action primary" id="install">Salva e installa su Stremio</a><button class="wide" id="copy">Copia URL di installazione</button><button class="wide" id="reset">Ripristina impostazioni predefinite</button></div><p id="status" role="status"></p><p>Le modifiche si applicano installando il nuovo URL. Non aggiungere una seconda copia: sostituisci quella precedente se necessario.</p><p><a href="/debug/sports">Diagnostica cataloghi</a> · <a href="/debug/stream-performance">Diagnostica fonti</a></p></main>'+
+  '<script>const defaults='+JSON.stringify(DEFAULT_SETTINGS)+';let config='+JSON.stringify(config)+';'+
+  'const labels={football:"⚽ LIVE Football",sport:"🔴 LIVE Sport",sv:"StremVerse",es:"EasySports",hf:"Highfly",0:"🇮🇹 Italiano",1:"🇬🇧 Inglese",2:"🌍 Altre lingue",3:"❔ Lingua sconosciuta"};'+
+  'const el=id=>document.getElementById(id);function row(parent,key,active,order,i,kind){const r=document.createElement("div");r.className="line";if(kind!=="languages"){const c=document.createElement("input");c.type="checkbox";c.checked=active;c.setAttribute("aria-label",labels[key]);c.onchange=()=>{const list=config[kind];if(c.checked){if(!list.includes(key))list.push(key)}else if(list.length>1)config[kind]=list.filter(x=>x!==key);else el("status").textContent="Mantieni almeno una opzione attiva.";render()};r.append(c)}'+
+  'const title=document.createElement("span");title.className="grow";title.textContent=(kind==="languages"||kind==="sources"&&active?String(i+1)+". ":"")+labels[key];r.append(title);if(order&&active){for(const d of [-1,1]){const b=document.createElement("button");b.textContent=d===-1?"↑":"↓";b.setAttribute("aria-label",(d===-1?"Sposta su ":"Sposta giù ")+labels[key]);b.disabled=i+d<0||i+d>=order.length;b.onclick=()=>{[order[i],order[i+d]]=[order[i+d],order[i]];render()};r.append(b)}}parent.append(r)}'+
+  'function manifestURL(){const token=btoa(JSON.stringify(config)).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"");return "https://dado-live-tv.onrender.com/c/"+token+"/manifest.json"}'+
+  'function render(){for(const k of ["catalogs","sources","languages"])el(k).replaceChildren();for(const k of defaults.catalogs)row(el("catalogs"),k,config.catalogs.includes(k),null,0,"catalogs");config.sources.forEach((k,i)=>row(el("sources"),k,true,config.sources,i,"sources"));defaults.sources.filter(k=>!config.sources.includes(k)).forEach(k=>row(el("sources"),k,false,null,0,"sources"));config.languages.forEach((k,i)=>row(el("languages"),k,true,config.languages,i,"languages"));el("proxy").value=config.proxy;el("install").href=manifestURL().replace("https://","stremio://")}'+
+  'el("proxy").onchange=()=>{config.proxy=el("proxy").value;render()};el("reset").onclick=()=>{config=JSON.parse(JSON.stringify(defaults));el("status").textContent="Impostazioni predefinite ripristinate.";render()};el("copy").onclick=async()=>{try{await navigator.clipboard.writeText(manifestURL());el("status").textContent="URL copiato."}catch{el("status").textContent=manifestURL()}};render();</script></body></html>';
+}
+app.get(["/configure","/c/:settings/configure"],(req,res)=>{
+  const config=requestSettings(req,res);if(!config)return;
+  res.set("Cache-Control","no-store");
+  res.type("html").send(configurePage(config));
+});
+
 /* =========================================================
    LOGO PERSONALIZZATO DADO LIVE TV
 ========================================================= */
@@ -1777,14 +1859,13 @@ app.get("/logo.png", (req, res) => {
 ========================================================= */
 
 app.get(
-  "/catalog/tv/live_football_v5.json",
+  ["/catalog/tv/live_football_v5.json","/c/:settings/catalog/tv/live_football_v5.json"],
   async (req, res) => {
 
     try {
 
-      const events =
-        await getCachedCatalog();
-
+      const config=requestSettings(req,res);if(!config)return;
+      const events = config.catalogs.includes("football")?(await getCachedCatalog()).filter(e=>eventAllowed(e,config)):[];
 
       res.json({
 
@@ -1820,9 +1901,11 @@ function combineSportResults(results) {
   return results.flatMap(r=>r.status==="fulfilled"?r.value:[])
     .sort((a,b)=>kickoff(a)-kickoff(b)||a.name.localeCompare(b.name,"it"));
 }
-app.get("/catalog/tv/live_sport_v1.json",async(req,res)=>{
+app.get(["/catalog/tv/live_sport_v1.json","/c/:settings/catalog/tv/live_sport_v1.json"],async(req,res)=>{
+  const config=requestSettings(req,res);if(!config)return;
+  if(!config.catalogs.includes("sport"))return res.json({metas:[]});
   const results=await Promise.allSettled(["motors","tennis"].map(getSportCatalog));
-  res.json({metas:combineSportResults(results).map(eventToMeta)});
+  res.json({metas:combineSportResults(results).filter(e=>eventAllowed(e,config)).map(eventToMeta)});
 });
 app.get("/debug/sports",async(req,res)=>{
   res.set("Cache-Control","no-store");
@@ -1874,18 +1957,15 @@ async function findEvent(id) {
 ========================================================= */
 
 app.get(
-  "/meta/tv/:id.json",
+  ["/meta/tv/:id.json","/c/:settings/meta/tv/:id.json"],
   async (req, res) => {
 
     try {
 
-      const event =
-        await findEvent(
-          req.params.id
-        );
+      const config=requestSettings(req,res);if(!config)return;
+      const event = await findEvent(req.params.id);
 
-
-      if (!event) {
+      if (!event || !eventAllowed(event,config)) {
 
         return res
           .status(404)
@@ -2008,7 +2088,7 @@ function labelStream(stream,source){
   const label=lang.label.replace(/\s+(?:IT|EN)$/,"");
   const channelLabel=label==="🇮🇹"?channel.replace(/\s+(?:IT|ITA|ITALIA)$/i,""):label==="🇬🇧"?channel.replace(/\s+(?:UK|EN|ENG)$/i,""):channel;
   const name=[names[source]||source,proxy?"[PROXY]":"",label,channelLabel].filter(Boolean).join(" ");
-  return {stream:{...stream,name},rank:lang.rank,sourceRank:STREAM_SOURCE_RANK[source]??99};
+  return {stream:{...stream,name},rank:lang.rank,sourceRank:STREAM_SOURCE_RANK[source]??99,proxy};
 }
 function sortStreamEntries(entries){
   return entries.slice().sort((a,b)=>a.rank-b.rank||a.sourceRank-b.sourceRank);
@@ -2084,20 +2164,8 @@ async function collectStreams(event) {
     })
   );
 
-  const streams = sortStreamEntries(results.flatMap(result =>
-    result.status === "fulfilled" ? result.value : []
-  )).map(entry=>entry.stream);
-
-  // Deduplicate after language/source ordering, preserving playback fields.
-  const unique = [];
-  const seen = new Set();
-  for (const stream of streams) {
-    const key = stream.url || stream.externalUrl || stream.ytId || JSON.stringify(stream);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(stream);
-  }
-  return unique;
+  // Cache raw ranked entries, so changing the order never loses duplicate alternatives.
+  return results.flatMap(result=>result.status==="fulfilled"?result.value:[]);
 }
 
 async function getCachedStreams(id, event) {
@@ -2130,17 +2198,16 @@ async function getCachedStreams(id, event) {
    STREAM ROUTE
 ========================================================= */
 
-app.get("/stream/tv/:id.json", async (req, res) => {
+app.get(["/stream/tv/:id.json","/c/:settings/stream/tv/:id.json"], async (req, res) => {
   try {
     // Fast path avoids even a catalog refresh for an immediate retry.
-    const cached = readCachedStreams(req.params.id);
-    if (cached) return res.json({ streams: cached });
-
-    const event = await findEvent(req.params.id);
-    if (!event) return res.json({ streams: [] });
-
-    const streams = await getCachedStreams(req.params.id, event);
-    res.json({ streams });
+    const config=requestSettings(req,res);if(!config)return;
+    const cached=readCachedStreams(req.params.id);
+    if(cached&&!req.params.settings)return res.json({streams:configuredStreamList(cached,config)});
+    const event=await findEvent(req.params.id);
+    if(!event||!eventAllowed(event,config))return res.json({streams:[]});
+    const entries=cached||await getCachedStreams(req.params.id,event);
+    res.json({streams:configuredStreamList(entries,config)});
   } catch (error) {
     console.error("Stream error:", error);
     res.json({ streams: [] });
