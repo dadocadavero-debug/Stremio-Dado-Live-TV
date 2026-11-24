@@ -540,7 +540,7 @@ function getEasySportsCatalogs() {
   return easySportsManifestInFlight;
 }
 
-// Prefer real StremVerse posters, then Highfly and EasySports artwork.
+// Prefer real StremVerse posters, then EasySports and Highfly artwork.
 // Preserve the selected image's own shape when merging matching events.
 function competitionLabel(meta) {
   for (const value of [meta.competition, meta.league, meta.tournament,
@@ -560,7 +560,7 @@ function pickArtwork(meta, source) {
   const valid = value => typeof value === "string" && /^https?:\/\//i.test(value.trim());
   const shapes = ["poster", "landscape", "square"];
   const shape = shapes.includes(meta.posterShape) ? meta.posterShape : null;
-  const priority = { sv: 0, hf: 1, es: 2 }[source] ?? 3;
+  const priority = { sv: 0, es: 1, hf: 2 }[source] ?? 3;
   if (valid(meta.poster)) return {
     poster: meta.poster.trim(),
     posterShape: shape || (source === "sv" ? "poster" : "landscape"),
