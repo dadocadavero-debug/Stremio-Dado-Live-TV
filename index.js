@@ -1162,10 +1162,10 @@ function pickDisplayTiming(event, now = Date.now()) {
     Math.abs(a.start-now) - Math.abs(b.start-now))[0] || null;
 }
 
-function artworkId(event, version = "v5") {
+function artworkId(event, version = "v6") {
   let identity = event.key + "\n" + event.poster;
   if (version !== "v1") identity += "\n" + event.name + "\n" + (event.competition || "");
-  if (["v3","v4","v5"].includes(version)) {
+  if (["v3","v4","v5","v6"].includes(version)) {
     const t = pickDisplayTiming(event);
     identity += "\n"+version+"\n" + (t?.start ?? "") + "\n" + (t?.precise ? "1" : "0");
   }
@@ -1183,7 +1183,7 @@ function artworkForMeta(event) {
   if (event.posterRank === 0 && event.posterShape === "poster") return event.poster;
   const id = artworkId(event);
   rememberBounded(artworkRefs, id, artworkReference(event), 1000);
-  return ARTWORK_ORIGIN + "/artwork/v5/" + id + ".jpg";
+  return ARTWORK_ORIGIN + "/artwork/v6/" + id + ".jpg";
 }
 
 function publicArtworkIP(ip) {
@@ -1356,58 +1356,33 @@ function competitionLogoId(value) {
 }
 const competitionLogoCache=new Map();
 const competitionLogoInFlight=new Map();
-// Remove only near-white background connected to the image perimeter, and only
-// for predominantly opaque white-bordered assets. Keep original transparent logos.
-function clearLogoBackground(data,width,height) {
-  const edge=[];
-  for(let y=0;y<height;y++)for(let x=0;x<width;x++){
-    if(x===0||y===0||x===width-1||y===height-1)edge.push(y*width+x);
+// Preserve the source PNG alpha and all white/coloured details.
+ // Only brighten the dark navy artwork of the Champions League mark for dark posters.
+function adaptCompetitionContrast(data, id) {
+  if (id !== 2) return data;
+  let transparent = false;
+  for (let i=3;i<data.length;i+=4) if (data[i]<32) {transparent=true;break;}
+  if(!transparent)return data;
+  for(let i=0;i<data.length;i+=4){
+    if(!data[i+3])continue;
+    const r=data[i],g=data[i+1],b=data[i+2];
+    const light=.2126*r+.7152*g+.0722*b;
+    if(light>=155 || b+8<r || b+8<g)continue;
+    // A pale silver-blue preserves contrast with white details and leaves alpha intact.
+    const mix=Math.min(1,Math.max(0,(155-light)/80));
+    data[i]=Math.round(r+(212-r)*mix);
+    data[i+1]=Math.round(g+(224-g)*mix);
+    data[i+2]=Math.round(b+(248-b)*mix);
   }
-  const white=i=>{
-    const p=i*4,r=data[p],g=data[p+1],b=data[p+2];
-    return data[p+3]>245&&Math.min(r,g,b)>=235&&Math.max(r,g,b)-Math.min(r,g,b)<=18;
-  };
-  if(!edge.length||edge.filter(white).length/edge.length<0.70)return data;
-  const visited=new Uint8Array(width*height),queue=[];
-  function add(i){if(!visited[i]&&white(i)){visited[i]=1;queue.push(i);}}
-  for(const i of edge)add(i);
-  for(let k=0;k<queue.length;k++){
-    const i=queue[k],x=i%width,y=Math.floor(i/width);
-    if(x>0)add(i-1);if(x<width-1)add(i+1);
-    if(y>0)add(i-width);if(y<height-1)add(i+width);
-  }
-  for(const i of queue)data[i*4+3]=0;
   return data;
 }
-// Thin pale edge only around dark artwork pixels for legibility on dark posters.
-// There is no filled rectangle or opaque background.
-function outlineDarkLogo(data,width,height) {
-  const result=Buffer.from(data);
-  for(let y=1;y<height-1;y++)for(let x=1;x<width-1;x++){
-    const p=(y*width+x)*4;
-    if(data[p+3]>0)continue;
-    let alpha=0;
-    for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
-      if(!dx&&!dy)continue;
-      const q=((y+dy)*width+x+dx)*4;
-      const luminance=.2126*data[q]+.7152*data[q+1]+.0722*data[q+2];
-      if(luminance<115)alpha=Math.max(alpha,Math.round(data[q+3]*.72));
-    }
-    if(alpha){result[p]=235;result[p+1]=239;result[p+2]=245;result[p+3]=alpha;}
-  }
-  return result;
-}
-
-async function transparentCompetitionLogo(input) {
+async function transparentCompetitionLogo(input,id) {
   const raw=await sharp(input,{limitInputPixels:4000000}).rotate()
-    .resize(176,176,{fit:"inside"}).ensureAlpha().raw().toBuffer({resolveWithObject:true});
-  const cleaned=clearLogoBackground(raw.data,raw.info.width,raw.info.height);
-  const small=await sharp(cleaned,{raw:{width:raw.info.width,height:raw.info.height,channels:4}})
-    .resize(82,82,{fit:"contain",background:{r:0,g:0,b:0,alpha:0}})
-    .extend({top:3,bottom:3,left:3,right:3,background:{r:0,g:0,b:0,alpha:0}})
-    .raw().toBuffer({resolveWithObject:true});
-  const outlined=outlineDarkLogo(small.data,small.info.width,small.info.height);
-  return sharp(outlined,{raw:{width:small.info.width,height:small.info.height,channels:4}}).png().toBuffer();
+    .ensureAlpha().raw().toBuffer({resolveWithObject:true});
+  const data=adaptCompetitionContrast(raw.data,id);
+  return sharp(data,{raw:{width:raw.info.width,height:raw.info.height,channels:4}})
+    .resize(88,88,{fit:"contain",background:{r:0,g:0,b:0,alpha:0}})
+    .png().toBuffer();
 }
 
 async function loadCompetitionLogo(id) {
@@ -1418,7 +1393,7 @@ async function loadCompetitionLogo(id) {
   const work=(async()=>{
     try {
       const input=await downloadArtwork("https://media.api-sports.io/football/leagues/"+id+".png");
-      const buffer=await transparentCompetitionLogo(input);
+      const buffer=await transparentCompetitionLogo(input,id);
       rememberBounded(competitionLogoCache,id,{buffer,expires:Date.now()+24*60*60*1000},40);
       return buffer;
     }catch{
@@ -1438,7 +1413,7 @@ function footerGeometry(topCount, bottomCount) {
     bottomStart:topStart+(topCount-1)*lineHeight+2*gap,lineHeight};
 }
 
-function portraitOverlay(source, hasLogo = false, version = "v5") {
+function portraitOverlay(source, hasLogo = false, version = "v6") {
   const competition = posterLines(cleanPosterText(source.competition) || "CALCIO", hasLogo ? 20 : 24, 2);
   const sides = getMatchSides(cleanPosterText(source.name)).map(cleanPosterText).filter(Boolean);
   const dateLabel = formatPosterDateTime(source.timing);
@@ -1483,7 +1458,7 @@ async function composePortrait(input, source, version) {
     .resize(448, 274, { fit: "inside" }).flatten({background:"#161920"}).png().toBuffer({resolveWithObject:true});
   const left = Math.floor((480 - foreground.info.width) / 2);
   const top = Math.floor(319 - foreground.info.height / 2);
-  const logo=["v4","v5"].includes(version)?await loadCompetitionLogo(competitionLogoId(source.competition)):null;
+  const logo=["v4","v5","v6"].includes(version)?await loadCompetitionLogo(competitionLogoId(source.competition)):null;
   return sharp(background).composite([
     { input: portraitOverlay(source,!!logo,version), top: 0, left: 0 },
     { input: foreground.data, top, left },
@@ -1501,7 +1476,7 @@ async function renderPortrait(id, source, version) {
   const work = scheduleArtwork(async () => {
     const input = await downloadArtwork(source.url);
     let buffer;
-    if (["v2","v3","v4","v5"].includes(version)) {
+    if (["v2","v3","v4","v5","v6"].includes(version)) {
       try { buffer = await composePortrait(input, source, version); }
       catch { console.warn("Decorated portrait unavailable; using plain portrait"); }
     }
@@ -1522,9 +1497,9 @@ async function renderPortrait(id, source, version) {
   return work;
 }
 
-app.get(["/artwork/v1/:id.jpg", "/artwork/v2/:id.jpg", "/artwork/v3/:id.jpg", "/artwork/v4/:id.jpg", "/artwork/v5/:id.jpg"], async (req, res) => {
+app.get(["/artwork/v1/:id.jpg", "/artwork/v2/:id.jpg", "/artwork/v3/:id.jpg", "/artwork/v4/:id.jpg", "/artwork/v5/:id.jpg", "/artwork/v6/:id.jpg"], async (req, res) => {
   const id = req.params.id;
-  const version = req.path.startsWith("/artwork/v5/") ? "v5" : req.path.startsWith("/artwork/v4/") ? "v4" : req.path.startsWith("/artwork/v3/") ? "v3" : req.path.startsWith("/artwork/v2/") ? "v2" : "v1";
+  const version = req.path.startsWith("/artwork/v6/") ? "v6" : req.path.startsWith("/artwork/v5/") ? "v5" : req.path.startsWith("/artwork/v4/") ? "v4" : req.path.startsWith("/artwork/v3/") ? "v3" : req.path.startsWith("/artwork/v2/") ? "v2" : "v1";
   if (!/^[a-f0-9]{64}$/.test(id)) return res.sendStatus(404);
   try {
     let source = artworkRefs.get(id);
