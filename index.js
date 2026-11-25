@@ -1754,14 +1754,14 @@ const localLoginAttempts=new Map();
 function accessHash(s){return crypto.createHash("sha256").update(s).digest("hex")}
 function accessEqual(a,b){return typeof a==="string"&&typeof b==="string"&&crypto.timingSafeEqual(Buffer.from(accessHash(a)),Buffer.from(accessHash(b)))}
 function validAccessId(id){return typeof id==="string"&&/^[a-z0-9_-]{1,40}$/.test(id)}
-function loadAccessUsers(){
+function loadAccessUsers(raw=process.env.DADO_ACCESS_USERS||"[]"){
   const registry=new Map();
   try{
-    const entries=JSON.parse(process.env.DADO_ACCESS_USERS||"[]");
+    const entries=JSON.parse(raw);
     if(!Array.isArray(entries)||entries.length>100)return registry;
     for(const u of entries){
       if(!u||!validAccessId(u.id)||registry.has(u.id)||typeof u.hash!=="string"||!/^[a-f0-9]{64}$/.test(u.hash)||typeof u.name!=="string"||typeof u.active!=="boolean")return new Map();
-      registry.set(u.id,{id:u.id,name:u.name,hash:u.hash,active:u.active});
+      registry.set(u.id,{id:u.id,name:u.name,hash:u.hash,active:u.active,inviteUsedAt:u.inviteUsedAt===null?null:Number.isFinite(u.inviteUsedAt)&&u.inviteUsedAt>0?u.inviteUsedAt:1});
     }
   }catch{return new Map()}
   return registry;
@@ -1802,7 +1802,7 @@ async function post(url,data){const r=await fetch(url,{method:"POST",credentials
 function showError(e){el("status").textContent=e.message}
 `;
 function loginPage(){
-  return accessPage("Dado Live TV — Accesso riservato",'<section><p>Accesso esclusivamente su invito.</p><form id="form"><label for="secret">Codice di invito personale</label><input id="secret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required><button class="primary">Accedi</button></form><p id="status" role="status"></p><p>Richiedi un codice all’amministratore.</p><p><a href="/admin">Accesso amministratore</a></p></section>',accessClient+'el("form").onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector("button");b.disabled=true;try{await post("/access/login",{secret:el("secret").value.trim()});location.replace("/configure")}catch(e){showError(e);b.disabled=false}}');
+  return accessPage("Dado Live TV — Accesso riservato",'<section><p>Accesso esclusivamente con un codice di invito monouso.</p><form id="form"><label for="secret">Codice di invito personale</label><input id="secret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required><button class="primary">Accedi</button></form><p id="status" role="status"></p><p>Richiedi un codice all’amministratore.</p><p><a href="/admin">Accesso amministratore</a></p></section>',accessClient+'el("form").onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector("button");b.disabled=true;try{await post("/access/login",{secret:el("secret").value.trim()});location.replace("/configure")}catch(e){showError(e);b.disabled=false}}');
 }
 function adminLoginPage(){
  return accessPage("Dado Live TV — Admin",'<section><form id="form"><label for="secret">Password amministratore</label><input id="secret" type="password" autocomplete="current-password" required><button class="primary">Accedi</button></form><p id="status" role="status"></p><p><a href="/configure">Accesso con invito</a></p></section>',accessClient+'el("form").onsubmit=async e=>{e.preventDefault();const b=e.target.querySelector("button");b.disabled=true;try{await post("/admin/login",{secret:el("secret").value});location.replace("/admin")}catch(e){showError(e);b.disabled=false}}');
@@ -1845,10 +1845,23 @@ app.get("/access",(req,res)=>res.redirect("/configure"));
 app.post("/access/login",accessAsync(async(req,res)=>{
  if(!sameOrigin(req))return accessDenied(res);if(!loginAllowed(req))return res.status(429).json({error:"Troppi tentativi. Riprova tra 10 minuti."});
  const code=req.body?.secret;if(typeof code!=="string"||!/^[A-Za-z0-9_-]{32,128}$/.test(code))return res.status(401).json({error:"Codice non valido."});
- const hash=accessHash(code);let user=null;
- for(const u of accessUsers.values()){if(u.id!=="owner"&&accessEqual(u.hash,hash)&&u.active)user=u}
- if(!user)return res.status(401).json({error:"Codice non valido o revocato."});
- setAccessCookie(res,"dado_user",{kind:"user-session",uid:user.id},30*86400);accessTouch(user.id);res.json({ok:true});
+ if(!managementReady())return accessFail(res);
+ if(renderChangeBusy||renderChangePending)return res.status(409).json({error:"Aggiornamento in corso. Riprova dopo il deploy."});
+ renderChangeBusy=true;
+ try{
+   await refreshAccessUsers();
+   const hash=accessHash(code);let user=null;
+   for(const u of accessUsers.values()){if(u.id!=="owner"&&accessEqual(u.hash,hash)&&u.active)user=u}
+   if(!user||user.inviteUsedAt!==null)return res.status(401).json({error:"Codice non valido, già utilizzato o revocato."});
+   // Prepare the session before consuming the invite; issue only after persistence.
+   const session=seal({kind:"user-session",uid:user.id,exp:Date.now()+30*86400000});
+   const updated={...user,inviteUsedAt:Date.now()};
+   await saveRenderSetting("DADO_ACCESS_USERS",JSON.stringify([...accessUsers.values()].map(u=>u.id===user.id?updated:u)));
+   accessUsers.set(user.id,updated);
+   res.cookie("dado_user",session,{httpOnly:true,secure:true,sameSite:"strict",path:"/",maxAge:30*86400000});
+   accessTouch(user.id);res.json({ok:true});
+ }catch{return res.status(503).json({error:"Attivazione non confermata. Se il codice risulta usato, chiedi un nuovo invito all’amministratore."})}
+ finally{renderChangeBusy=false}
 }));
 app.post("/admin/login",accessAsync(async(req,res)=>{
  if(!sameOrigin(req))return accessDenied(res);
@@ -1869,6 +1882,15 @@ function managementReady(){return !!renderAdminKey.trim()}
 async function renderAdminRequest(method,path,body){
  const r=await fetch("https://api.render.com/v1/services/"+renderAdminService+path,{method,redirect:"error",headers:{Authorization:"Bearer "+renderAdminKey,"Content-Type":"application/json",Accept:"application/json"},body:JSON.stringify(body),signal:AbortSignal.timeout(12000)});
  if(!r.ok)throw Error("Render HTTP "+r.status);
+ if(method==="GET")return r.json();
+}
+async function refreshAccessUsers(){
+ const data=await renderAdminRequest("GET","/env-vars/DADO_ACCESS_USERS");
+ const item=data?.envVar||data;
+ if(typeof item?.value!=="string")throw Error("Invalid registry");
+ const registry=loadAccessUsers(item.value);
+ if(!registry.get("owner")?.active)throw Error("Invalid registry");
+ accessUsers.clear();for(const [id,u] of registry)accessUsers.set(id,u);
 }
 async function saveRenderSetting(key,value){
  if(!["DADO_ACCESS_USERS","DADO_ADMIN_VERIFIER"].includes(key))throw Error("Invalid setting");
@@ -1883,14 +1905,21 @@ function managementRoute(fn){return accessAsync(async(req,res)=>{
  if(!loginAllowed(req))return res.status(429).json({error:"Troppi tentativi. Riprova tra 10 minuti."});
  if(!verifyAdminPassword(req.body?.password))return res.status(401).json({error:"Password amministratore non valida."});
  renderChangeBusy=true;
- try{await fn(req,res)}catch{res.status(502).json({error:"Operazione non confermata. Controlla Render prima di riprovare."})}finally{renderChangeBusy=false}
+ try{await refreshAccessUsers();await fn(req,res)}catch{res.status(502).json({error:"Operazione non confermata. Controlla Render prima di riprovare."})}finally{renderChangeBusy=false}
 })}
 app.post("/admin/invite",managementRoute(async(req,res)=>{
  const name=typeof req.body?.name==="string"?req.body.name.trim():"";
  if(!name||name.length>60||accessUsers.size>=100)return res.status(400).json({error:"Nome non valido o limite utenti raggiunto."});
- const id=crypto.randomBytes(12).toString("hex"),code=crypto.randomBytes(24).toString("base64url"),user={id,name,active:true,hash:accessHash(code)};
+ const id=crypto.randomBytes(12).toString("hex"),code=crypto.randomBytes(24).toString("base64url"),user={id,name,active:true,hash:accessHash(code),inviteUsedAt:null};
  const deployed=await saveRenderSetting("DADO_ACCESS_USERS",JSON.stringify([...accessUsers.values(),user]));
  accessUsers.set(id,user);res.json({code,deployed});
+}));
+app.post("/admin/reinvite",managementRoute(async(req,res)=>{
+ const u=accessUser(req.body?.id);
+ if(!u||u.id==="owner"||!u.active)return res.status(400).json({error:"Seleziona un utente attivo."});
+ const code=crypto.randomBytes(24).toString("base64url"),updated={...u,hash:accessHash(code),inviteUsedAt:null};
+ const deployed=await saveRenderSetting("DADO_ACCESS_USERS",JSON.stringify([...accessUsers.values()].map(v=>v.id===u.id?updated:v)));
+ accessUsers.set(u.id,updated);res.json({code,deployed});
 }));
 app.post("/admin/state",managementRoute(async(req,res)=>{
  const u=accessUser(req.body?.id);
@@ -1910,14 +1939,14 @@ app.post("/admin/password",managementRoute(async(req,res)=>{
 }));
 app.get("/admin",(req,res)=>{
  if(!ownerSession(req))return res.type("html").send(adminLoginPage());
- const users=[...accessUsers.values()].map(u=>({id:u.id,name:u.name,owner:u.id==="owner",active:u.active,lastSeen:accessActivity.get(u.id)||null,...(accessStats.get(u.id)||{requests:0,streams:0,lastEvent:null,sources:{sv:0,hf:0,es:0}})}));
- const data={users,started:accessStartedAt,version:"3.5.6",management:managementReady(),pending:renderChangeBusy||renderChangePending};
- const body='<section><h2>Panoramica</h2><div id="summary"></div><small id="since"></small><p>Le statistiche si azzerano al riavvio. Contano richieste e fonti offerte, non le partite effettivamente viste.</p></section><section id="management"><h2>Gestione accessi</h2><p>Ogni modifica richiede un deploy. Conserva il codice appena generato.</p><form id="invite-form"><h3>Crea nuovo utente</h3><label for="invite-name">Nome del nuovo utente</label><input id="invite-name" maxlength="60" required><label for="invite-password">Password amministratore (per autorizzare il nuovo utente)</label><input id="invite-password" type="password" autocomplete="current-password" required><button class="primary">Genera codice invito</button></form><form id="password-form"><h3>Cambia password amministratore</h3><label for="current-password">Password amministratore attuale</label><input id="current-password" type="password" autocomplete="current-password" required><label for="new-password">Nuova password amministratore (minimo 10 caratteri)</label><input id="new-password" type="password" minlength="10" maxlength="256" autocomplete="new-password" required><label for="confirm-password">Conferma nuova password amministratore</label><input id="confirm-password" type="password" minlength="10" maxlength="256" autocomplete="new-password" required><button class="primary">Cambia password amministratore</button></form></section><section><h2>Utenti autorizzati</h2><div id="users"></div><p id="management-note"></p><p id="invite-code"></p><button id="copy-invite" hidden>Copia codice</button><button onclick="location.reload()">Aggiorna</button></section><p><a href="/configure">Configura addon</a> · <button id="logout">Esci</button></p><p id="status" role="status"></p>';
+ const users=[...accessUsers.values()].map(u=>({id:u.id,name:u.name,owner:u.id==="owner",active:u.active,inviteUsedAt:u.inviteUsedAt,lastSeen:accessActivity.get(u.id)||null,...(accessStats.get(u.id)||{requests:0,streams:0,lastEvent:null,sources:{sv:0,hf:0,es:0}})}));
+ const data={users,started:accessStartedAt,version:"3.5.7",management:managementReady(),pending:renderChangeBusy||renderChangePending};
+ const body='<section><h2>Panoramica</h2><div id="summary"></div><small id="since"></small><p>Le statistiche si azzerano al riavvio. Contano richieste e fonti offerte, non le partite effettivamente viste.</p></section><section id="management"><h2>Gestione accessi</h2><p>Ogni modifica richiede un deploy. Il codice di invito è monouso: conservalo e invialo soltanto al destinatario.</p><form id="invite-form"><h3>Crea nuovo utente</h3><label for="invite-name">Nome del nuovo utente</label><input id="invite-name" maxlength="60" required><label for="invite-password">Password amministratore (per autorizzare il nuovo utente)</label><input id="invite-password" type="password" autocomplete="current-password" required><button class="primary">Genera codice invito monouso</button></form><form id="password-form"><h3>Cambia password amministratore</h3><label for="current-password">Password amministratore attuale</label><input id="current-password" type="password" autocomplete="current-password" required><label for="new-password">Nuova password amministratore (minimo 10 caratteri)</label><input id="new-password" type="password" minlength="10" maxlength="256" autocomplete="new-password" required><label for="confirm-password">Conferma nuova password amministratore</label><input id="confirm-password" type="password" minlength="10" maxlength="256" autocomplete="new-password" required><button class="primary">Cambia password amministratore</button></form></section><section><h2>Utenti autorizzati</h2><div id="users"></div><p id="management-note"></p><p id="invite-code"></p><button id="copy-invite" hidden>Copia codice</button><button onclick="location.reload()">Aggiorna</button></section><p><a href="/configure">Configura addon</a> · <button id="logout">Esci</button></p><p id="status" role="status"></p>';
  const js=accessClient+'const data='+JSON.stringify(data).replace(/</g,"\\u003c")+';'+String.raw`
 const fmt=t=>t?new Date(t).toLocaleString("it-IT",{timeZone:"Europe/Rome"}):"non rilevata";
 el("summary").textContent=data.users.filter(u=>u.active).length+" autorizzati · "+data.users.filter(u=>!u.active).length+" revocati · v"+data.version;
 el("since").textContent="Statistiche dal "+fmt(data.started);
-for(const u of data.users){const a=document.createElement("article"),n=document.createElement("strong"),d=document.createElement("small"),r=document.createElement("span"),e=document.createElement("span"),f=document.createElement("small");n.textContent=u.name+(u.owner?" · Amministratore":"");d.textContent=(u.active?"Attivo":"Revocato")+" · Ultima attività: "+fmt(u.lastSeen);r.textContent="Richieste addon: "+u.requests+" · Richieste streaming: "+u.streams;e.textContent="Ultimo evento richiesto: "+(u.lastEvent||"—");f.textContent="Fonti offerte: StremVerse "+u.sources.sv+" · Highfly "+u.sources.hf+" · EasySports "+u.sources.es;a.append(n,d,r,e,f);if(!u.owner&&data.management&&!data.pending){const p=document.createElement("input"),b=document.createElement("button");p.type="password";p.autocomplete="current-password";p.placeholder="Password amministratore";b.textContent=u.active?"Revoca":"Riattiva";b.className="manage-action";b.onclick=()=>changeState(u,p);a.append(p,b)}el("users").append(a)}
+for(const u of data.users){const a=document.createElement("article"),n=document.createElement("strong"),d=document.createElement("small"),r=document.createElement("span"),e=document.createElement("span"),f=document.createElement("small");n.textContent=u.name+(u.owner?" · Amministratore":"");d.textContent=(u.active?"Attivo":"Revocato")+" · Ultima attività: "+fmt(u.lastSeen);r.textContent="Richieste addon: "+u.requests+" · Richieste streaming: "+u.streams;e.textContent="Ultimo evento richiesto: "+(u.lastEvent||"—");f.textContent="Fonti offerte: StremVerse "+u.sources.sv+" · Highfly "+u.sources.hf+" · EasySports "+u.sources.es;a.append(n,d,r,e,f);if(!u.owner){const info=document.createElement("small");info.textContent=u.inviteUsedAt===null?"Invito: non utilizzato":u.inviteUsedAt===1?"Invito precedente: rigenera codice":"Invito utilizzato: "+fmt(u.inviteUsedAt);a.append(info)}if(!u.owner&&data.management&&!data.pending){const p=document.createElement("input"),b=document.createElement("button");p.type="password";p.autocomplete="current-password";p.placeholder="Password amministratore";b.textContent=u.active?"Revoca":"Riattiva";b.className="manage-action";b.onclick=()=>changeState(u,p);a.append(p,b);if(u.active){const again=document.createElement("button");again.className="manage-action";again.textContent="Rigenera codice invito";again.onclick=()=>reinvite(u,p);a.append(again)}}el("users").append(a)}
 
 let issuedCode="",busy=data.pending;
 el("management").hidden=!data.management;
@@ -1929,9 +1958,14 @@ async function changeState(u,p){
  if(busy||!confirm((u.active?"Revocare ":"Riattivare ")+u.name+"?"))return;
  const password=p.value;p.value="";lock(true);try{outcome(await post("/admin/state",{id:u.id,active:!u.active,password}))}catch(e){showError(e);lock(false)}
 }
+async function reinvite(u,p){
+ if(busy||!confirm("Rigenerare l’invito per "+u.name+"? Il vecchio codice sarà annullato; i manifest già installati resteranno validi."))return;
+ const password=p.value;p.value="";lock(true);
+ try{const d=await post("/admin/reinvite",{id:u.id,password});issuedCode=d.code;el("invite-code").textContent="Nuovo codice monouso: "+issuedCode;el("copy-invite").hidden=false;outcome(d);el("invite-code").scrollIntoView({block:"center"});}catch(e){showError(e);lock(false)}
+}
 el("invite-form").onsubmit=async e=>{
  e.preventDefault();if(busy)return;const password=el("invite-password").value;el("invite-password").value="";
- lock(true);try{const d=await post("/admin/invite",{name:el("invite-name").value,password});issuedCode=d.code;el("invite-code").textContent="Conserva il codice: "+issuedCode;el("copy-invite").hidden=false;el("invite-name").value="";outcome(d)}catch(e){showError(e);lock(false)}
+ lock(true);try{const d=await post("/admin/invite",{name:el("invite-name").value,password});issuedCode=d.code;el("invite-code").textContent="Conserva il codice monouso: "+issuedCode;el("copy-invite").hidden=false;el("invite-name").value="";outcome(d)}catch(e){showError(e);lock(false)}
 };
 el("copy-invite").onclick=async()=>{try{await navigator.clipboard.writeText(issuedCode);el("status").textContent="Codice copiato."}catch(e){showError(e)}};
 el("password-form").onsubmit=async e=>{
@@ -2019,7 +2053,7 @@ const manifest = {
     "community.stremio.live.football.test",
 
   version:
-    "3.5.6",
+    "3.5.7",
 
   name:
     "Dado Live TV",
@@ -2133,7 +2167,7 @@ function configurePage(config,previousToken="",showAdmin=false) {
   const publicConfig={...config,easyProxyPassword:""};
   // Only validated ASCII preference values are inserted into the script.
   return '<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dado Live TV | Configurazione</title><style>'+
-  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}a.action[aria-disabled="true"]{opacity:.4;cursor:default}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.5.6</p></div></header>'+
+  ':root{color-scheme:dark;font-family:system-ui,sans-serif;background:#11131b;color:#f1f2f6}*{box-sizing:border-box}body{margin:0;padding:22px 16px 40px}main{max-width:560px;margin:auto}header{display:flex;align-items:center;gap:14px;margin-bottom:22px}header img{width:72px;height:72px;border-radius:15px}h1{font-size:25px;margin:0}h2{font-size:17px;margin:0 0 12px}p{line-height:1.5;color:#b5bac9;font-size:14px;margin:8px 0}section{background:#20232e;border:1px solid #343747;padding:17px;border-radius:15px;margin:12px 0}.line{display:flex;align-items:center;gap:10px;min-height:44px;border-bottom:1px solid #383b48}.line:last-child{border:0}.grow{flex:1}.rank{color:#aeb5c7;min-width:20px}input{accent-color:#36c981;width:20px;height:20px}button,select,a.action{font:inherit;border:1px solid #484d60;border-radius:9px;background:#2c303d;color:#fff;padding:8px 12px;cursor:pointer}button:disabled{opacity:.32;cursor:default}.disabled{opacity:.42}.field{width:100%;height:auto;padding:12px;margin:6px 0;background:#2c303d;border:1px solid #484d60;border-radius:9px;color:#fff;font:inherit}a.action{text-decoration:none;display:block;text-align:center}a.primary{background:#29bc75;color:#082519;font-weight:700;border:0;padding:14px}a.action[aria-disabled="true"]{opacity:.4;cursor:default}button.wide{width:100%;padding:12px;margin-top:8px}select{width:100%;padding:12px}a{color:#7eb5ff}.actions{display:grid;gap:9px;margin-top:20px}#status{min-height:22px;color:#a4e8c4;overflow-wrap:anywhere}small{color:#b5bac9}</style></head><body><main><header><img src="/logo.png" alt="Dado Live TV"><div><h1>Dado Live TV</h1><p>Configurazione personale · v3.5.7</p></div></header>'+
   (showAdmin?'<a class="action" href="/admin" style="margin-bottom:16px;padding:12px">🔐 Pannello amministratore</a>':'')+
   '<section><h2>Cataloghi nella Home</h2><div id="catalogs"></div></section>'+
   '<section><h2>EasyProxy · solo EasySports</h2><p>StremVerse e Highfly restano invariati. Inserisci un URL valido per abilitare EasySports.</p><label for="easyurl">URL EasyProxy</label><input class="field" id="easyurl" type="url" placeholder="http://IP:7860" autocomplete="off"><label for="easypass">Password API (facoltativa)</label><input class="field" id="easypass" type="password" autocomplete="new-password"><p id="proxystate"></p></section>'+
