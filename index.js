@@ -1403,6 +1403,7 @@ function decodeEventId(id) {
 const ARTWORK_ORIGIN = "https://dado-live-tv.onrender.com";
 const artworkRefs = new Map();
 const landscapeArtworkRefs = new Map();
+const landscapeArtworkCache = new Map();
 const artworkCache = new Map();
 const artworkInFlight = new Map();
 const artworkQueue = [];
@@ -1463,7 +1464,8 @@ function landscapeForMeta(event) {
   if (!event.landscapeArtwork && !event.poster) return undefined;
   const id = landscapeArtworkId(event);
   rememberBounded(landscapeArtworkRefs, id, landscapeArtworkReference(event), 1000);
-  return ARTWORK_ORIGIN + "/artwork/landscape/v1/" + id + ".jpg";
+  const origin = (process.env.RENDER_EXTERNAL_URL || ARTWORK_ORIGIN).replace(/\/+$/, "");
+  return origin + "/artwork/landscape/v1/" + id + ".jpg";
 }
 
 function publicArtworkIP(ip) {
@@ -2061,8 +2063,11 @@ app.get(["/artwork/v1/:id.jpg", "/artwork/v2/:id.jpg", "/artwork/v3/:id.jpg", "/
 // Reuse the bounded downloader and queue. Contain avoids cropping artwork.
 async function renderLandscape(id, source) {
   const key = "landscape:" + id;
-  const cached = artworkCache.get(key);
-  if (cached && cached.expires > Date.now()) return cached.buffer;
+  const cached = landscapeArtworkCache.get(key);
+  if (cached && cached.expires > Date.now()) {
+    rememberBounded(landscapeArtworkCache, key, cached, 96);
+    return cached.buffer;
+  }
   if (artworkInFlight.has(key)) return artworkInFlight.get(key);
   const work = scheduleArtwork(async () => {
     const urls = [...new Set([source.preferred, source.fallback].filter(Boolean))];
@@ -2072,7 +2077,8 @@ async function renderLandscape(id, source) {
         const buffer = await sharp(input, { limitInputPixels: 16000000 })
           .rotate().resize(640, 360, { fit: "contain", background: "#161920" })
           .flatten({ background: "#161920" }).jpeg({ quality: 86 }).toBuffer();
-        rememberBounded(artworkCache, key, { buffer, expires: Date.now() + 2 * 60 * 60 * 1000 }, 96);
+        const ttl = source.preferred && url !== source.preferred ? 5 * 60 * 1000 : 2 * 60 * 60 * 1000;
+        rememberBounded(landscapeArtworkCache, key, { buffer, expires: Date.now() + ttl }, 96);
         return buffer;
       } catch {
         // Try existing artwork without exposing provider URLs.
