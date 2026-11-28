@@ -1820,7 +1820,7 @@ function loginAllowed(req){
 // Public entry points and image assets only. All other paths are denied by default.
 app.use(accessAsync(async(req,res,next)=>{
   const path=req.path;
-  if(path==="/logo.png"||/^\/artwork\/v[1-6]\/[a-f0-9]+\.jpg$/.test(path))return next();
+  if(path==="/logo.png"||((req.method==="GET"||req.method==="HEAD")&&path==="/artwork/hero-preview.jpg")||/^\/artwork\/v[1-6]\/[a-f0-9]+\.jpg$/.test(path))return next();
   res.set("Cache-Control","no-store");res.set("Referrer-Policy","no-referrer");
   if(!accessReady())return accessFail(res);
   if(path==="/"&&req.method==="GET")return res.redirect("/configure");
@@ -2011,6 +2011,82 @@ app.get(["/artwork/v1/:id.jpg", "/artwork/v2/:id.jpg", "/artwork/v3/:id.jpg", "/
     res.set("Cache-Control", "no-store");
     return res.sendStatus(502);
   }
+});
+
+
+const heroLogoCache = new Map(), heroLogoInFlight = new Map();
+async function heroLogo(kind,id) {
+  if(!["teams","leagues"].includes(kind)||!Number.isSafeInteger(Number(id))||Number(id)<=0)return null;
+  const key=kind+":"+id, cached=heroLogoCache.get(key);
+  if(cached&&cached.expires>Date.now())return cached.buffer;
+  if(heroLogoInFlight.has(key))return heroLogoInFlight.get(key);
+  const work=(async()=>{
+    try {
+      const input=await downloadArtwork("https://media.api-sports.io/football/"+kind+"/"+Number(id)+".png");
+      const raw=await sharp(input,{limitInputPixels:4000000}).rotate().ensureAlpha().png().toBuffer();
+      const buffer=await sharp(raw).trim({background:"#00000000",threshold:8})
+        .resize(kind==="leagues"?260:380,kind==="leagues"?220:380,{fit:"contain",background:"#00000000"}).png().toBuffer();
+      rememberBounded(heroLogoCache,key,{buffer,expires:Date.now()+7*86400000},80);return buffer;
+    }catch{
+      rememberBounded(heroLogoCache,key,{buffer:null,expires:Date.now()+10*60000},80);return null;
+    }
+  })().finally(()=>heroLogoInFlight.delete(key));
+  heroLogoInFlight.set(key,work);return work;
+}
+function heroSvg(home,away,league,leagueId) {
+  const href=b=>"data:image/png;base64,"+b.toString("base64");
+  const accent=({135:"#357ee8",2:"#344bcf",3:"#ec7928",848:"#36b382",39:"#7457ce",140:"#df4a4b",78:"#ce3c48",61:"#4665d3",88:"#e67b31"})[leagueId]||"#467bc0";
+  const crest=(b,x,flip)=>{
+    const skew=flip?-0.12:0.12, depth=flip?12:-12;
+    const image=(dx,dy,opacity)=>'<image x="'+dx+'" y="'+dy+'" width="350" height="350" xlink:href="'+href(b)+'" opacity="'+opacity+'"/>';
+    return '<g transform="translate('+x+' 292) matrix(.88 '+skew+' 0 1 0 0)">'+image(depth,15,.20)+image(depth/2,8,.35)+image(0,0,1)+'</g>';
+  };
+  return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1920" height="1080" viewBox="0 0 1920 1080">'+
+    '<defs><linearGradient id="bg"><stop stop-color="#080c15"/><stop offset=".48" stop-color="#111e32"/><stop offset="1" stop-color="#08111f"/></linearGradient>'+
+    '<radialGradient id="halo"><stop stop-color="'+accent+'" stop-opacity=".48"/><stop offset="1" stop-color="'+accent+'" stop-opacity="0"/></radialGradient>'+
+    '<linearGradient id="edge"><stop stop-color="#040912" stop-opacity=".92"/><stop offset=".6" stop-color="#040912" stop-opacity="0"/></linearGradient>'+
+    '<linearGradient id="bottom" x1="0" x2="0" y1="0" y2="1"><stop offset=".55" stop-color="#050913" stop-opacity="0"/><stop offset="1" stop-color="#050913" stop-opacity=".94"/></linearGradient>'+
+    '<radialGradient id="badge"><stop stop-color="#ffffff" stop-opacity=".95"/><stop offset="1" stop-color="#c5d0e0" stop-opacity=".86"/></radialGradient></defs>'+
+    '<rect width="1920" height="1080" fill="url(#bg)"/><ellipse cx="1450" cy="380" rx="720" ry="540" fill="url(#halo)"/>'+
+    '<path d="M1190 0H1470L975 1080H695Z M1575 0H1740L1245 1080H1080Z" fill="'+accent+'" opacity=".075"/>'+
+    '<path d="M1170 0L670 1080 M1760 0L1260 1080" stroke="#e0e9fa" stroke-width="2" opacity=".12"/>'+
+    '<rect width="1920" height="1080" fill="url(#edge)"/>'+
+    '<ellipse cx="1450" cy="695" rx="410" ry="36" fill="#050914" opacity=".32"/>'+
+    '<rect x="1324" y="80" width="252" height="192" rx="24" fill="url(#badge)" opacity=".96"/>'+
+    '<image x="1342" y="90" width="216" height="172" xlink:href="'+href(league)+'"/>'+
+    crest(home,1050,false)+crest(away,1510,true)+
+    '<path d="M1434 430h32l-25 43h-32z" fill="#cfddf1" opacity=".7"/>'+
+    '<path d="M1455 430h17l-25 43h-17z" fill="'+accent+'"/>'+
+    '<rect width="1920" height="1080" fill="url(#bottom)"/></svg>');
+}
+
+let heroPreviewBuffer=null, heroPreviewWork=null, heroPreviewFailedUntil=0;
+function buildHeroPreview(){
+  if(heroPreviewBuffer)return Promise.resolve(heroPreviewBuffer);
+  if(heroPreviewWork)return heroPreviewWork;
+  if(Date.now()<heroPreviewFailedUntil)return Promise.resolve(null);
+  heroPreviewWork=scheduleArtwork(async()=>{
+    const [home,away,league]=await Promise.all([heroLogo("teams",505),heroLogo("teams",495),heroLogo("leagues",135)]);
+    if(!home||!away||!league){
+      console.log("HERO_PREVIEW",JSON.stringify({ok:false,home:!!home,away:!!away,league:!!league}));
+      return null;
+    }
+    const buffer=await sharp(heroSvg(home,away,league,135),{limitInputPixels:4000000}).jpeg({quality:87}).toBuffer();
+    const m=await sharp(buffer).metadata();
+    if(m.width!==1920||m.height!==1080)throw Error("Invalid preview size");
+    heroPreviewBuffer=buffer;
+    console.log("HERO_PREVIEW",JSON.stringify({ok:true,width:m.width,height:m.height,bytes:buffer.length}));
+    return buffer;
+  }).catch(e=>{console.log("HERO_PREVIEW",JSON.stringify({ok:false,stage:"render",error:String(e.message).slice(0,120)}));return null;})
+    .then(b=>{if(!b)heroPreviewFailedUntil=Date.now()+60000;return b;})
+    .finally(()=>{heroPreviewWork=null;});
+  return heroPreviewWork;
+}
+app.get("/artwork/hero-preview.jpg",async(req,res)=>{
+  const b=await buildHeroPreview();
+  if(!b){res.set("Cache-Control","no-store");return res.sendStatus(503);}
+  res.set("Cache-Control","public, max-age=300");
+  return res.type("jpeg").send(b);
 });
 
 function eventToMeta(event) {
@@ -2762,6 +2838,7 @@ app.listen(
       const m=await getJsonRaw(rebuilt+"/manifest.json",6000);
       console.log("EasySports compatibility check:",JSON.stringify({manifestValid:Array.isArray(m.catalogs),catalogCount:Array.isArray(m.catalogs)?m.catalogs.length:0}));
     }catch{console.log("EasySports compatibility check: upstream request failed");}})();
+    buildHeroPreview().catch(()=>{});
     // Prepare the catalog as soon as the process starts, without blocking listen.
     getCachedCatalog().catch(()=>console.warn("Initial catalog refresh unavailable"));
   }
