@@ -2762,32 +2762,61 @@ app.listen(
       const m=await getJsonRaw(rebuilt+"/manifest.json",6000);
       console.log("EasySports compatibility check:",JSON.stringify({manifestValid:Array.isArray(m.catalogs),catalogCount:Array.isArray(m.catalogs)?m.catalogs.length:0}));
     }catch{console.log("EasySports compatibility check: upstream request failed");}})();
-    // Temporary API-Football feasibility probe; no catalog or playback changes.
+    // Temporary test only: current squad -> candidate name -> Wikimedia photo and licence.
     if (process.env.API_FOOTBALL_KEY) {
       (async () => {
-        for (const team of [505, 495]) {
-          try {
-            const response = await fetch("https://v3.football.api-sports.io/players/squads?team=" + team, {
-              headers: { "x-apisports-key": process.env.API_FOOTBALL_KEY },
-              signal: AbortSignal.timeout(10000)
-            });
-            const data = await response.json();
-            const squad = data.response?.[0];
-            const players = Array.isArray(squad?.players) ? squad.players : [];
-            const candidates = players.filter(p => p.position === "Attacker" && /^https:\/\/media\.api-sports\.io\/football\/players\/\d+\.png$/.test(p.photo || ""));
-            const player = candidates[0] || players.find(p => /^https:\/\/media\.api-sports\.io\/football\/players\/\d+\.png$/.test(p.photo || ""));
-            let image = null;
-            if (player) {
-              try {
-                const bytes = await downloadArtwork(player.photo);
-                const m = await sharp(bytes, { limitInputPixels: 16000000 }).metadata();
-                image = { name: player.name, width: m.width, height: m.height, alpha: m.hasAlpha };
-              } catch { image = { name: player.name, error: "photo unavailable" }; }
-            }
-            console.log("API_FOOTBALL_PROBE", JSON.stringify({ team, teamName: squad?.team?.name, status: response.status, players: players.length, errorKeys: Object.keys(data.errors || {}), image }));
-          } catch { console.log("API_FOOTBALL_PROBE", JSON.stringify({ team, error: "request failed" })); }
+        const ua = "DadoLiveTV-ArtworkProbe/1.0 (https://github.com/dadocadavero-debug/Stremio-Dado-Live-TV)";
+        async function wiki(host, params) {
+          const u = new URL("/w/api.php", host);
+          u.search = new URLSearchParams({format:"json",formatversion:"2",...params}).toString();
+          const res = await fetch(u, {headers:{"User-Agent":ua,"Accept":"application/json"},signal:AbortSignal.timeout(10000)});
+          if (!res.ok) throw new Error("Wikimedia HTTP "+res.status);
+          const data = await res.json();
+          if (data.error) throw new Error("Wikimedia API error");
+          return data;
         }
-      })().catch(() => {});
+        const norm = s => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase();
+        // Known full-name expansions for this test only; never assume these for other fixtures.
+        const examples = [
+          {id:505, names:[["martinez","Lautaro Martínez"],["barella","Nicolò Barella"],["thuram","Marcus Thuram"],["henrique","Luis Henrique (footballer, born 2001)"]]},
+          {id:495, names:[["colombo","Lorenzo Colombo"],["vitinha","Vitinha (footballer, born 2000)"],["frendrup","Morten Frendrup"],["malinovskyi","Ruslan Malinovskyi"]]}
+        ];
+        for (const team of examples) {
+          try {
+            const res = await fetch("https://v3.football.api-sports.io/players/squads?team="+team.id,{headers:{"x-apisports-key":process.env.API_FOOTBALL_KEY},signal:AbortSignal.timeout(10000)});
+            const data = await res.json();
+            const squad = data.response?.[0];
+            const roster = Array.isArray(squad?.players) ? squad.players : [];
+            const trials = [];
+            for (const [needle, fullName] of team.names) {
+              const player = roster.find(p=>norm(p.name).includes(needle));
+              if (!player) continue;
+              try {
+                const w = await wiki("https://en.wikipedia.org",{action:"query",redirects:"1",titles:fullName,prop:"pageimages",piprop:"name",pilicense:"free"});
+                const page = w.query?.pages?.[0];
+                if (!page?.pageimage) { trials.push({player:player.name,reason:"no free page image"});continue; }
+                const c = await wiki("https://commons.wikimedia.org",{action:"query",titles:"File:"+page.pageimage,prop:"imageinfo",iiprop:"url|size|mime|extmetadata",iiurlwidth:"800",iiextmetadatafilter:"LicenseShortName|LicenseUrl|Artist|Credit|AttributionRequired"});
+                const info = c.query?.pages?.[0]?.imageinfo?.[0];
+                const license = info?.extmetadata?.LicenseShortName?.value || "";
+                const okLicense = /^(CC0|CC BY(?:-SA)? [1-4]\.0|Public domain)$/i.test(license);
+                let downloaded = false, dimensions = null;
+                if (okLicense && info.width>=500 && info.height>=500 && ["image/jpeg","image/png","image/webp"].includes(info.mime)) {
+                  const link = new URL(info.thumburl || info.url);
+                  if (link.protocol==="https:" && link.hostname==="upload.wikimedia.org") {
+                    const photo = await fetch(link,{headers:{"User-Agent":ua},signal:AbortSignal.timeout(10000)});
+                    if (photo.ok && Number(photo.headers.get("content-length")||0)<=5000000) {
+                      const buf = Buffer.from(await photo.arrayBuffer());
+                      if(buf.length<=5000000) { const m = await sharp(buf,{limitInputPixels:16000000}).metadata(); downloaded=true;dimensions=[m.width,m.height]; }
+                    }
+                  }
+                }
+                trials.push({player:player.name,page:page.title,file:page.pageimage,license,width:info?.width,height:info?.height,downloaded,dimensions,source:info?.descriptionurl,artist:info?.extmetadata?.Artist?.value?.replace(/<[^>]*>/g,"").slice(0,200)});
+              } catch(e) {trials.push({player:player.name,error:String(e.message).slice(0,100)});}
+            }
+            console.log("WIKIMEDIA_ARTWORK_PROBE",JSON.stringify({team:team.id,teamName:squad?.team?.name,roster:roster.length,trials}));
+          } catch {console.log("WIKIMEDIA_ARTWORK_PROBE",JSON.stringify({team:team.id,error:"roster unavailable"}));}
+        }
+      })().catch(()=>{});
     }
     // Prepare the catalog as soon as the process starts, without blocking listen.
     getCachedCatalog().catch(()=>console.warn("Initial catalog refresh unavailable"));
