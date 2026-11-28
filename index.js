@@ -1820,7 +1820,7 @@ function loginAllowed(req){
 // Public entry points and image assets only. All other paths are denied by default.
 app.use(accessAsync(async(req,res,next)=>{
   const path=req.path;
-  if(path==="/logo.png"||((req.method==="GET"||req.method==="HEAD")&&path==="/artwork/hero-preview.jpg")||/^\/artwork\/v[1-6]\/[a-f0-9]+\.jpg$/.test(path))return next();
+  if(path==="/logo.png"||((req.method==="GET"||req.method==="HEAD")&&path==="/artwork/hero-preview-v2.jpg")||/^\/artwork\/v[1-6]\/[a-f0-9]+\.jpg$/.test(path))return next();
   res.set("Cache-Control","no-store");res.set("Referrer-Policy","no-referrer");
   if(!accessReady())return accessFail(res);
   if(path==="/"&&req.method==="GET")return res.redirect("/configure");
@@ -2035,28 +2035,31 @@ async function heroLogo(kind,id) {
 }
 function heroSvg(home,away,league,leagueId) {
   const href=b=>"data:image/png;base64,"+b.toString("base64");
-  const accent=({135:"#357ee8",2:"#344bcf",3:"#ec7928",848:"#36b382",39:"#7457ce",140:"#df4a4b",78:"#ce3c48",61:"#4665d3",88:"#e67b31"})[leagueId]||"#467bc0";
-  const crest=(b,x,flip)=>{
-    const skew=flip?-0.12:0.12, depth=flip?12:-12;
-    const image=(dx,dy,opacity)=>'<image x="'+dx+'" y="'+dy+'" width="350" height="350" xlink:href="'+href(b)+'" opacity="'+opacity+'"/>';
-    return '<g transform="translate('+x+' 292) matrix(.88 '+skew+' 0 1 0 0)">'+image(depth,15,.20)+image(depth/2,8,.35)+image(0,0,1)+'</g>';
+  const accent=({135:"#253f75",2:"#303a71",3:"#65402d",848:"#284b40",39:"#443259",140:"#633337",78:"#603236",61:"#324575",88:"#65402d"})[leagueId]||"#354b65";
+  // Identical optical centres and mirrored transforms around each centre,
+  // not the top-left corner. Keep the original RGBA colours untouched.
+  const crest=(b,x,side)=>{
+    const skew=side*0.075;
+    return '<g transform="translate('+x+' 435)">'+
+      '<g transform="matrix(.95 '+skew+' 0 1 0 0)">'+
+      '<image x="-168" y="-168" width="336" height="336" xlink:href="'+href(b)+'" filter="url(#shadow)"/>'+
+      '</g></g>';
   };
   return Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1920" height="1080" viewBox="0 0 1920 1080">'+
-    '<defs><linearGradient id="bg"><stop stop-color="#080c15"/><stop offset=".48" stop-color="#111e32"/><stop offset="1" stop-color="#08111f"/></linearGradient>'+
-    '<radialGradient id="halo"><stop stop-color="'+accent+'" stop-opacity=".48"/><stop offset="1" stop-color="'+accent+'" stop-opacity="0"/></radialGradient>'+
-    '<linearGradient id="edge"><stop stop-color="#040912" stop-opacity=".92"/><stop offset=".6" stop-color="#040912" stop-opacity="0"/></linearGradient>'+
-    '<linearGradient id="bottom" x1="0" x2="0" y1="0" y2="1"><stop offset=".55" stop-color="#050913" stop-opacity="0"/><stop offset="1" stop-color="#050913" stop-opacity=".94"/></linearGradient>'+
-    '<radialGradient id="badge"><stop stop-color="#ffffff" stop-opacity=".95"/><stop offset="1" stop-color="#c5d0e0" stop-opacity=".86"/></radialGradient></defs>'+
-    '<rect width="1920" height="1080" fill="url(#bg)"/><ellipse cx="1450" cy="380" rx="720" ry="540" fill="url(#halo)"/>'+
-    '<path d="M1190 0H1470L975 1080H695Z M1575 0H1740L1245 1080H1080Z" fill="'+accent+'" opacity=".075"/>'+
-    '<path d="M1170 0L670 1080 M1760 0L1260 1080" stroke="#e0e9fa" stroke-width="2" opacity=".12"/>'+
+    '<defs><linearGradient id="bg"><stop stop-color="#080a0e"/><stop offset=".58" stop-color="#171c24"/><stop offset="1" stop-color="#10141a"/></linearGradient>'+
+    '<radialGradient id="halo"><stop stop-color="'+accent+'" stop-opacity=".46"/><stop offset="1" stop-color="'+accent+'" stop-opacity="0"/></radialGradient>'+
+    '<linearGradient id="edge"><stop stop-color="#080a0e" stop-opacity=".98"/><stop offset=".57" stop-color="#080a0e" stop-opacity="0"/></linearGradient>'+
+    '<linearGradient id="bottom" x1="0" x2="0" y1="0" y2="1"><stop offset=".62" stop-color="#080a0e" stop-opacity="0"/><stop offset="1" stop-color="#080a0e" stop-opacity=".90"/></linearGradient>'+
+    '<filter id="shadow" x="-.25" y="-.25" width="1.5" height="1.5" color-interpolation-filters="sRGB"><feGaussianBlur in="SourceAlpha" stdDeviation="9" result="blur"/><feOffset in="blur" dx="0" dy="12" result="shift"/><feFlood flood-color="#000000" flood-opacity=".56" result="ink"/><feComposite in="ink" in2="shift" operator="in" result="shadow"/><feMerge><feMergeNode in="shadow"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>'+
+    '<rect width="1920" height="1080" fill="url(#bg)"/><ellipse cx="1450" cy="410" rx="650" ry="500" fill="url(#halo)"/>'+
+    '<path d="M1190 0H1420L980 1080H750Z M1720 0H1830L1390 1080H1280Z" fill="#ffffff" opacity=".025"/>'+
     '<rect width="1920" height="1080" fill="url(#edge)"/>'+
-    '<ellipse cx="1450" cy="695" rx="410" ry="36" fill="#050914" opacity=".32"/>'+
-    '<rect x="1324" y="80" width="252" height="192" rx="24" fill="url(#badge)" opacity=".96"/>'+
-    '<image x="1342" y="90" width="216" height="172" xlink:href="'+href(league)+'"/>'+
-    crest(home,1050,false)+crest(away,1510,true)+
-    '<path d="M1434 430h32l-25 43h-32z" fill="#cfddf1" opacity=".7"/>'+
-    '<path d="M1455 430h17l-25 43h-17z" fill="'+accent+'"/>'+
+    '<rect x="1346" y="77" width="208" height="153" rx="15" fill="#e7e9ed" stroke="#ffffff" stroke-opacity=".3"/>'+
+    '<image x="1360" y="86" width="180" height="135" xlink:href="'+href(league)+'"/>'+
+    crest(home,1220,1)+crest(away,1680,-1)+
+    '<path d="M1450 388V482" stroke="#c6ccd6" stroke-width="1.5" opacity=".25"/>'+
+    '<circle cx="1450" cy="435" r="31" fill="#171c24" stroke="#c6ccd6" stroke-opacity=".24"/>'+
+    '<text x="1450" y="444" text-anchor="middle" font-family="sans-serif" font-size="24" font-weight="600" letter-spacing="1" fill="#d5d9df">VS</text>'+
     '<rect width="1920" height="1080" fill="url(#bottom)"/></svg>');
 }
 
@@ -2071,7 +2074,7 @@ function buildHeroPreview(){
       console.log("HERO_PREVIEW",JSON.stringify({ok:false,home:!!home,away:!!away,league:!!league}));
       return null;
     }
-    const buffer=await sharp(heroSvg(home,away,league,135),{limitInputPixels:4000000}).jpeg({quality:87}).toBuffer();
+    const buffer=await sharp(heroSvg(home,away,league,135),{limitInputPixels:4000000}).jpeg({quality:94,chromaSubsampling:"4:4:4"}).toBuffer();
     const m=await sharp(buffer).metadata();
     if(m.width!==1920||m.height!==1080)throw Error("Invalid preview size");
     heroPreviewBuffer=buffer;
@@ -2082,7 +2085,7 @@ function buildHeroPreview(){
     .finally(()=>{heroPreviewWork=null;});
   return heroPreviewWork;
 }
-app.get("/artwork/hero-preview.jpg",async(req,res)=>{
+app.get("/artwork/hero-preview-v2.jpg",async(req,res)=>{
   const b=await buildHeroPreview();
   if(!b){res.set("Cache-Control","no-store");return res.sendStatus(503);}
   res.set("Cache-Control","public, max-age=300");
