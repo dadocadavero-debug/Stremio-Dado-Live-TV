@@ -2124,8 +2124,6 @@ function eventToMeta(event) {
 
     poster: artworkForMeta(event),
 
-    background: leagueHeroForEvent(event),
-
     posterShape: "poster",
 
     description:
