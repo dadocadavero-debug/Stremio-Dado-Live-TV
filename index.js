@@ -656,43 +656,23 @@ function competitionLabel(meta) {
   return "";
 }
 
-// Independent landscape choice: prefer EasySports without changing portrait ranking.
-function pickLandscapeArtwork(meta, source) {
-  const valid = value => typeof value === "string" && /^https?:\/\//i.test(value.trim());
-  const sourceRank = { es: 0, hf: 1, sv: 2 }[source] ?? 3;
-  const candidates = [
-    meta.landscapePoster,
-    (meta.posterShape === "landscape" || (!["poster", "square"].includes(meta.posterShape) && (source === "es" || source === "hf"))) ? meta.poster : null,
-    meta.background,
-    meta.backdrop
-  ];
-  const index = candidates.findIndex(valid);
-  return index < 0
-    ? { landscapeArtwork: null, landscapeRank: Infinity }
-    : { landscapeArtwork: candidates[index].trim(), landscapeRank: sourceRank * 10 + index };
-}
-
 function pickArtwork(meta, source) {
   const valid = value => typeof value === "string" && /^https?:\/\//i.test(value.trim());
   const shapes = ["poster", "landscape", "square"];
   const shape = shapes.includes(meta.posterShape) ? meta.posterShape : null;
   const priority = { sv: 0, es: 1, hf: 2 }[source] ?? 3;
-  const landscape = pickLandscapeArtwork(meta, source);
   if (valid(meta.poster)) return {
-    ...landscape,
     poster: meta.poster.trim(),
     posterShape: shape || (source === "sv" ? "poster" : "landscape"),
     posterRank: priority
   };
   if (valid(meta.background)) return {
-    ...landscape,
     poster: meta.background.trim(), posterShape: "landscape", posterRank: 10 + priority
   };
   if (valid(meta.logo)) return {
-    ...landscape,
     poster: meta.logo.trim(), posterShape: "square", posterRank: 20 + priority
   };
-  return { poster: null, posterShape: null, posterRank: Infinity, ...landscape };
+  return { poster: null, posterShape: null, posterRank: Infinity };
 }
 
 function preferArtwork(target, candidate) {
@@ -700,10 +680,6 @@ function preferArtwork(target, candidate) {
     target.poster = candidate.poster;
     target.posterShape = candidate.posterShape;
     target.posterRank = candidate.posterRank;
-  }
-  if (candidate.landscapeArtwork && (!target.landscapeArtwork || candidate.landscapeRank < target.landscapeRank)) {
-    target.landscapeArtwork = candidate.landscapeArtwork;
-    target.landscapeRank = candidate.landscapeRank;
   }
 }
 
@@ -1238,8 +1214,6 @@ async function getCatalogEvents(sport = 'football') {
         poster: event.poster,
         posterShape: event.posterShape,
         posterRank: event.posterRank,
-        landscapeArtwork: event.landscapeArtwork,
-        landscapeRank: event.landscapeRank,
         competition: event.competition,
         timings: [],
 
@@ -1402,8 +1376,6 @@ function decodeEventId(id) {
 // Serve a real portrait JPEG with the complete fallback artwork centered inside.
 const ARTWORK_ORIGIN = "https://dado-live-tv.onrender.com";
 const artworkRefs = new Map();
-const landscapeArtworkRefs = new Map();
-const landscapeArtworkCache = new Map();
 const artworkCache = new Map();
 const artworkInFlight = new Map();
 const artworkQueue = [];
@@ -1447,25 +1419,6 @@ function artworkForMeta(event) {
   const id = artworkId(event);
   rememberBounded(artworkRefs, id, artworkReference(event), 1000);
   return ARTWORK_ORIGIN + "/artwork/v6/" + id + ".jpg";
-}
-
-// Opaque IDs keep upstream image URLs out of client metadata.
-function landscapeArtworkId(event) {
-  return crypto.createHash("sha256").update(JSON.stringify([
-    "landscape-v1", event.key, event.landscapeArtwork || "", event.poster || ""
-  ])).digest("hex");
-}
-
-function landscapeArtworkReference(event) {
-  return { preferred: event.landscapeArtwork || "", fallback: event.poster || "" };
-}
-
-function landscapeForMeta(event) {
-  if (!event.landscapeArtwork && !event.poster) return undefined;
-  const id = landscapeArtworkId(event);
-  rememberBounded(landscapeArtworkRefs, id, landscapeArtworkReference(event), 1000);
-  const origin = (process.env.RENDER_EXTERNAL_URL || ARTWORK_ORIGIN).replace(/\/+$/, "");
-  return origin + "/artwork/landscape/v1/" + id + ".jpg";
 }
 
 function publicArtworkIP(ip) {
@@ -2060,63 +2013,6 @@ app.get(["/artwork/v1/:id.jpg", "/artwork/v2/:id.jpg", "/artwork/v3/:id.jpg", "/
   }
 });
 
-// Reuse the bounded downloader and queue. Contain avoids cropping artwork.
-async function renderLandscape(id, source) {
-  const key = "landscape:" + id;
-  const cached = landscapeArtworkCache.get(key);
-  if (cached && cached.expires > Date.now()) {
-    rememberBounded(landscapeArtworkCache, key, cached, 96);
-    return cached.buffer;
-  }
-  if (artworkInFlight.has(key)) return artworkInFlight.get(key);
-  const work = scheduleArtwork(async () => {
-    const urls = [...new Set([source.preferred, source.fallback].filter(Boolean))];
-    for (const url of urls) {
-      try {
-        const input = await downloadArtwork(url);
-        const buffer = await sharp(input, { limitInputPixels: 16000000 })
-          .rotate().resize(640, 360, { fit: "contain", background: "#161920" })
-          .flatten({ background: "#161920" }).jpeg({ quality: 86 }).toBuffer();
-        const ttl = source.preferred && url !== source.preferred ? 5 * 60 * 1000 : 2 * 60 * 60 * 1000;
-        rememberBounded(landscapeArtworkCache, key, { buffer, expires: Date.now() + ttl }, 96);
-        return buffer;
-      } catch {
-        // Try existing artwork without exposing provider URLs.
-      }
-    }
-    throw new Error("Landscape artwork unavailable");
-  }).finally(() => artworkInFlight.delete(key));
-  artworkInFlight.set(key, work);
-  return work;
-}
-
-app.get("/artwork/landscape/v1/:id.jpg", async (req, res) => {
-  const id = req.params.id;
-  if (!/^[a-f0-9]{64}$/.test(id)) return res.sendStatus(404);
-  try {
-    let source = landscapeArtworkRefs.get(id);
-    if (!source) {
-      const match = item => (item.landscapeArtwork || item.poster) && landscapeArtworkId(item) === id;
-      let event = [...catalogCache.events, ...Array.from(sportCaches.values()).flatMap(c => c.events)].find(match);
-      if (!event) {
-        const groups = await Promise.allSettled(["football", "motors", "tennis"].map(getSportCatalog));
-        event = groups.flatMap(g => g.status === "fulfilled" ? g.value : []).find(match);
-      }
-      if (event) {
-        source = landscapeArtworkReference(event);
-        rememberBounded(landscapeArtworkRefs, id, source, 1000);
-      }
-    }
-    if (!source) return res.sendStatus(404);
-    const buffer = await renderLandscape(id, source);
-    res.set("Cache-Control", "public, max-age=1800");
-    return res.type("jpeg").send(buffer);
-  } catch {
-    res.set("Cache-Control", "no-store");
-    return res.sendStatus(502);
-  }
-});
-
 function eventToMeta(event) {
 
   return {
@@ -2133,7 +2029,6 @@ function eventToMeta(event) {
       event.name,
 
     poster: artworkForMeta(event),
-    landscapePoster: landscapeForMeta(event),
 
     posterShape: "poster",
 
@@ -2867,6 +2762,33 @@ app.listen(
       const m=await getJsonRaw(rebuilt+"/manifest.json",6000);
       console.log("EasySports compatibility check:",JSON.stringify({manifestValid:Array.isArray(m.catalogs),catalogCount:Array.isArray(m.catalogs)?m.catalogs.length:0}));
     }catch{console.log("EasySports compatibility check: upstream request failed");}})();
+    // Temporary API-Football feasibility probe; no catalog or playback changes.
+    if (process.env.API_FOOTBALL_KEY) {
+      (async () => {
+        for (const team of [505, 495]) {
+          try {
+            const response = await fetch("https://v3.football.api-sports.io/players/squads?team=" + team, {
+              headers: { "x-apisports-key": process.env.API_FOOTBALL_KEY },
+              signal: AbortSignal.timeout(10000)
+            });
+            const data = await response.json();
+            const squad = data.response?.[0];
+            const players = Array.isArray(squad?.players) ? squad.players : [];
+            const candidates = players.filter(p => p.position === "Attacker" && /^https:\/\/media\.api-sports\.io\/football\/players\/\d+\.png$/.test(p.photo || ""));
+            const player = candidates[0] || players.find(p => /^https:\/\/media\.api-sports\.io\/football\/players\/\d+\.png$/.test(p.photo || ""));
+            let image = null;
+            if (player) {
+              try {
+                const bytes = await downloadArtwork(player.photo);
+                const m = await sharp(bytes, { limitInputPixels: 16000000 }).metadata();
+                image = { name: player.name, width: m.width, height: m.height, alpha: m.hasAlpha };
+              } catch { image = { name: player.name, error: "photo unavailable" }; }
+            }
+            console.log("API_FOOTBALL_PROBE", JSON.stringify({ team, teamName: squad?.team?.name, status: response.status, players: players.length, errorKeys: Object.keys(data.errors || {}), image }));
+          } catch { console.log("API_FOOTBALL_PROBE", JSON.stringify({ team, error: "request failed" })); }
+        }
+      })().catch(() => {});
+    }
     // Prepare the catalog as soon as the process starts, without blocking listen.
     getCachedCatalog().catch(()=>console.warn("Initial catalog refresh unavailable"));
   }
